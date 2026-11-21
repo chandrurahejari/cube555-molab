@@ -3592,6 +3592,13 @@ DepthDispatchState run_depth_cuda_graphs(
         stream4_logical_running_shard[logical_shard] = shard;
         const std::uint64_t graph_idx =
             static_cast<std::uint64_t>(shard) * plan.config.stream4_active_sort_slots + slot;
+        // Selection of a write buffer and publication of the shard counts
+        // form one transaction. Do not compact a shard mid-transaction.
+        if (!multi_rank && stream3_active) {
+            check_cuda(cudaStreamWaitEvent(streams.stream4_slot_streams[slot],
+                                           stream3_done[stream3_active_ring], 0),
+                       "wait for partition before compacting shard");
+        }
         scan_tracked_stream4_input(shard, slot, graph_idx);
         debug_stream4_histogram_trace("stream4_launch_pre", shard, slot);
         debug_pipeline_stats(stats_phase, shard, slot);
@@ -3762,6 +3769,12 @@ DepthDispatchState run_depth_cuda_graphs(
     const auto try_launch_stream3 = [&]() -> bool {
         if (stream3_active || stream3_ready_rings.empty()) {
             return false;
+        }
+        if (!multi_rank) {
+            for (const auto slot : stream4_busy_slots) {
+                check_cuda(cudaStreamWaitEvent(streams.stream3, streams.stream4_slot_done[slot], 0),
+                           "wait for shard counts before reserving space");
+            }
         }
         if (!multi_rank && !stream3_has_writable_buffer()) {
             if (stop_stage != DepthDispatchStopStage::Full) {
@@ -5142,6 +5155,10 @@ FinalizeDepthState finalize_depth_single_gpu(
                 history_stream), "cudaMemcpyAsync final candidates to host history");
         }
         check_cuda(cudaEventRecord(history_copy_done, history_stream), "cudaEventRecord history copy done");
+        // final_candidate_buffer aliases the scratch used by next depth's
+        // scoring rings. Release the allocation only after D2H has read it.
+        check_cuda(cudaStreamWaitEvent(streams.stream3, history_copy_done, 0),
+                   "wait for history before reusing depth scratch");
     }
 
 #if BEAM_DEBUG_STREAM_TIMING
