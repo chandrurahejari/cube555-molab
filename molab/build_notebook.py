@@ -131,19 +131,27 @@ def embedded_body():
     return body
 
 
-def generate_notebook(destination, puzzle_id, beam_width, max_depth=300, *, queue_ids=None, symmetry=0, inverse=False):
+def generate_notebook(destination, puzzle_id, beam_width, max_depth=None, *, queue_ids=None, symmetry=0, inverse=False):
     """Write one self-contained cloud notebook, embedding comparison lengths only."""
     if type(puzzle_id) is not int or not 0 <= puzzle_id <= 1034:
         raise ValueError("Cube ID must be an integer in 0..1034")
     if type(beam_width) is not int or not 1 <= beam_width < 2**64:
         raise ValueError("Beam must be a positive uint64")
-    if type(max_depth) is not int or not 1 <= max_depth < 2**32:
-        raise ValueError("Maximum depth must be a positive uint32 integer")
     if type(inverse) is not bool or type(symmetry) is not int or symmetry not in range(48):
         raise ValueError("Symmetry must be an index 0..47 and inverse must be boolean")
     selected = list(dict.fromkeys([puzzle_id, *(queue_ids or [])]))
     if any(type(pid) is not int or not 0 <= pid <= 1034 for pid in selected):
         raise ValueError("Every queued cube ID must be an integer in 0..1034")
+    reference = baseline_reference()
+    if max_depth is None:
+        lengths = reference.get("lengths", {})
+        if all(pid in lengths for pid in selected):
+            reference["queue_depths"] = {pid: lengths[pid]+10 for pid in selected}
+            max_depth = reference["queue_depths"][puzzle_id]
+        else:
+            max_depth = 300
+    if type(max_depth) is not int or not 1 <= max_depth < 2**32:
+        raise ValueError("Maximum depth must be a positive uint32 integer")
     body = embedded_body()
     configured = (header.replace("__FIRST_CUBE__", str(puzzle_id))
                         .replace("__BEAM_WIDTH__", str(beam_width))
@@ -152,7 +160,7 @@ def generate_notebook(destination, puzzle_id, beam_width, max_depth=300, *, queu
                         .replace("__INVERSE__", repr(inverse))
                         .replace("__NOTEBOOK_KEY__", repr(uuid.uuid4().hex))
                         .replace("__LONGEST_CUBES__", repr(selected))
-                        .replace("__BASELINE__", repr(baseline_reference())))
+                        .replace("__BASELINE__", repr(reference)))
     text = configured + textwrap.indent(body, "    ") + tail
     target = Path(destination).resolve()
     if target.suffix != ".py":
@@ -179,9 +187,9 @@ def main():
         selected = sorted((pid for pid in lengths if lengths[pid] >= 111), key=lambda pid: (-lengths[pid], pid))
         if not selected:
             parser.error("Provide --cube or a baseline file containing paths at least 111 moves long")
-        target = generate_notebook(args.output, selected[0], args.beam, args.depth or 115, queue_ids=selected, symmetry=args.symmetry, inverse=args.inverse)
+        target = generate_notebook(args.output, selected[0], args.beam, args.depth, queue_ids=selected, symmetry=args.symmetry, inverse=args.inverse)
     else:
-        target = generate_notebook(args.output, args.cube, args.beam, args.depth or 300, symmetry=args.symmetry, inverse=args.inverse)
+        target = generate_notebook(args.output, args.cube, args.beam, args.depth, symmetry=args.symmetry, inverse=args.inverse)
     print(target, target.stat().st_size)
 
 

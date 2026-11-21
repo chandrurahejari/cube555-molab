@@ -25,6 +25,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 import uuid
+import zipfile
 
 ROOT = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
 DATA = ROOT / 'runs'
@@ -142,15 +143,48 @@ def tpu_control_plan(lengths):
     examples = [(76, 40, 0, False), (142, 100, 0, False), (994, 110, 45, True),
                 (82, 40, 12, True), (166, 100, 23, False), (170, 110, 31, True)]
     cases = []
-    for cycle in range(48):
+    for cycle in range(96):
         for cube, length, frame, inverse in examples:
             if lengths.get(cube) != length:
                 raise ValueError(f'Кубик {cube}: ожидалось {length} ходов в исходном CSV.')
-            cases.append(dict(cube=cube, beam=4_194_304, requested_depth=length + 12,
-                              symmetry=(frame+cycle) % 48, inverse=inverse ^ bool(cycle % 2),
+            cases.append(dict(cube=cube, beam=4_194_304, requested_depth=length + 10,
+                              symmetry=(frame+cycle) % 48, inverse=inverse ^ bool((cycle + cycle//48) % 2),
                               case_number=len(cases)+1, lane='tpu_controls',
                               purpose=f'Контроль поиска Cube555 для пути длиной {length}'))
     return cases
+
+
+def read_competition(path):
+    with zipfile.ZipFile(path) as archive:
+        rules = json.loads(archive.read('puzzle_info.json'))
+        with archive.open('test.csv') as file, io.TextIOWrapper(file, encoding='utf-8-sig') as text:
+            states = {int(r['initial_state_id']): tuple(map(int, r['initial_state'].split(','))) for r in csv.DictReader(text)}
+    return states, rules['generators'], tuple(rules['central_state'])
+
+
+def update_best_path(best, job, competition):
+    """Accept only an actual notebook result that also replays on its original puzzle."""
+    solution = verified_path({'job':job})
+    cube = job.get('cube')
+    if not solution or job.get('result_origin') != 'google_drive' or not job.get('id') or type(cube) is not int:
+        return False
+    key = str(cube)
+    if key in best and best[key]['length'] <= solution['length']:
+        return False
+    states, moves, goal = competition
+    state = states.get(cube)
+    if state is None:
+        return False
+    for name in solution['path'].split('.') if solution['path'] else []:
+        if name not in moves:
+            return False
+        state = tuple(state[i] for i in moves[name])
+    if state != goal:
+        return False
+    best[key] = dict(length=solution['length'], path=solution['path'], symmetry=job.get('symmetry'),
+                     inverse=job.get('inverse'), requested_beam=job.get('beam'), run=job.get('key'),
+                     notebook_id=job['id'], url=job.get('url'), drive_url=job.get('drive_url'))
+    return True
 
 
 def unwrap_report(value):
@@ -329,6 +363,30 @@ class Controller:
         self.commands = queue.Queue()
         self.snapshot = {}
         self.lengths = baseline_lengths()
+        self.best_path_file = self.data / 'best-verified-paths.json'
+        self.best_paths = read_json(self.best_path_file, {})
+        archive = self.first.parent / 'competition.zip'
+        self.competition = read_competition(archive) if archive.is_file() else None
+        if self.competition:
+            changed = False
+            for path in sorted((self.first.parent / 'runs').glob('*/job.json')):
+                if update_best_path(self.best_paths, read_json(path, {}), self.competition):
+                    changed = True
+            if changed:
+                atomic_json(self.best_path_file, self.best_paths)
+        if self.state.get('mode') == 'tpu_controls' and self.state.get('depth_margin') != 10:
+            lengths = {int(k):v for k,v in self.state['baseline_lengths'].items()}
+            started = {t['case_number'] for t in self.state['jobs']}
+            old = {c['case_number']:c for c in self.state['plan']}
+            rate = self.state['estimated_seconds_per_million']
+            plan = tpu_control_plan(lengths)
+            for i, case in enumerate(plan):
+                if case['case_number'] in started:
+                    plan[i] = old[case['case_number']]
+                else:
+                    case['estimated_seconds'] = math.ceil(600 + rate * case['beam']/1e6 * (case['requested_depth']-3))
+            self.state.update(plan=plan, depth_margin=10)
+            self.persist()
         if (self.state.get('status') == 'running' and self.state.get('listing') is None
                 and self.state.get('message','').startswith('Список Molab недоступен')
                 and 'last_list_failure' not in self.state):
@@ -360,6 +418,8 @@ class Controller:
 
     def refresh_snapshot(self):
         self.snapshot = json.loads(json.dumps(self.state)) if self.state else {}
+        if self.snapshot:
+            self.snapshot['best_paths'] = self.best_paths.copy()
 
     def reconcile_local_launches(self):
         """Recover a form card; only proven pre-import failures release a slot."""
@@ -456,6 +516,7 @@ class Controller:
                 planned.extend([dict(a, estimated_seconds=estimated),dict(b, estimated_seconds=estimated)])
                 budget -= 2 * estimated
             if tpu_controls:
+                self.state['depth_margin'] = 10
                 for case in plan:
                     case['estimated_seconds'] = math.ceil(600 + rate * case['beam']/1e6 * (case['requested_depth']-3))
             elif not repair:
@@ -665,6 +726,8 @@ class Controller:
             if action != 'shutdown':
                 test['classification'] = classify(job, report)
             solution = verified_path(test)
+            if self.competition and update_best_path(self.best_paths, job, self.competition):
+                atomic_json(self.best_path_file, self.best_paths)
             if solution and isinstance(test.get('baseline_length'),int):
                 test['verified_solution'] = solution.copy()
                 test['improvement'] = test['baseline_length'] - solution['length']
@@ -1375,6 +1438,12 @@ def main():
                     f"Среднее время полного шага ≥7: {statistics.mean(full):.3f} с\n" if full else
                     f"Кубик {test['cube']} · луч {test['beam']} · симметрия {test['symmetry']}\nПолных измеренных шагов ≥7 пока нет.\n")
             direction = 'обратное' if test.get('inverse') else 'прямое'
+            best = snapshot.get('best_paths',{}).get(str(test['cube']))
+            if best:
+                best_direction = 'реверс' if best['inverse'] else 'прямой'
+                text += (f"Лучший проверенный путь Molab за все серии: {best['length']} ходов "
+                         f"(S{best['symmetry']}, {best_direction}, луч {best['requested_beam']}).\n"
+                         f"{best['path']}\n{best['url']}\n")
             text += f"Направление: {direction}. Исходная длина CSV: {test['baseline_length']}.\n{job.get('url', '')}\nGoogle Drive: {job.get('drive_url', '—')}\nОшибка: {test.get('last_error', 'нет')}\nПуть: {(job.get('solution') or {}).get('path', 'ещё не получен')}\n{job.get('last_log', '')[-3500:]}"
             if test.get('improvement',0)>0:
                 text = f"Проверенное улучшение на {test['improvement']} ходов.\n" + text

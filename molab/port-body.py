@@ -926,8 +926,9 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
             raise RuntimeError("NVIDIA driver visible but PyTorch CUDA initialization found no devices")
         architectures = sorted({tuple(dev["cc"]) for dev in devices})
         arch = ";".join(f"{major}{minor}" for major, minor in architectures)
+        queue_depths = (baseline or {}).get("queue_depths", {})
         env.update(CUBE555_WORLD_SIZE=str(ranks), CUBE555_CUDA_ARCH=arch,
-                   CUBE555_MAX_DEPTH=str(requested_depth),
+                   CUBE555_MAX_DEPTH=str(max([requested_depth, *queue_depths.values()])),
                    CUBE555_DEVICE_BYTES=str(min(dev["bytes"] for dev in devices)),
                    TORCH_CUDA_ARCH_LIST=";".join(f"{a}.{b}" for a, b in architectures),
                    CMAKE_CUDA_ARCHITECTURES=arch,
@@ -969,7 +970,7 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         for queued_pid in queue_ids:
             if queued_pid == puzzle_id:
                 continue
-            queued = case("length111", queued_pid, requested_beam, requested_depth)
+            queued = case("length111", queued_pid, requested_beam, queue_depths.get(queued_pid, requested_depth))
             if queued["status"] == "failed":
                 raise RuntimeError(queued["error"] + " — " + queued.get("diagnostic", ""))
             save()

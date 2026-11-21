@@ -212,6 +212,8 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual([v['cube'] for v in state['plan'][:6]], list(lengths))
         cases = {(v['cube'], v['symmetry'], v['inverse']) for v in state['plan']}
         self.assertEqual(len(cases), len(state['plan']))
+        self.assertEqual(len([x for x in cases if x[0] == 994]),96)
+        self.assertEqual([c['requested_depth'] for c in state['plan'][:6]], [50,110,120,50,110,120])
         self.assertEqual((state['plan'][2]['symmetry'],state['plan'][2]['inverse']), (45,True))
         self.assertEqual(self.controller.plan_next()['beam'], 4194304)
         self.assertEqual(module.MAX_RUNNING, 1)
@@ -224,6 +226,19 @@ class BenchmarkTests(unittest.TestCase):
         self.now = state['deadline']
         self.controller.tick()
         self.assertEqual(state['status'], 'finished')
+
+    def test_best_verified_measured_path_compares_directions_and_replays_original(self):
+        best = {}
+        competition = ({76:(1,0)}, {'r0':(1,0), '-r0':(1,0), 'f0':(0,1)}, (0,1))
+        job = dict(cube=76, id='nb_measured', result_origin='google_drive', symmetry=4, inverse=True,
+                   solution={'path':'r0.r0.r0', 'length':3, 'verified':True})
+        self.assertTrue(module.update_best_path(best,job,competition))
+        job.update(symmetry=1, inverse=False, solution={'path':'f0','length':1,'verified':True})
+        self.assertFalse(module.update_best_path(best,job,competition))
+        job['solution']['path'] = '-r0'
+        self.assertTrue(module.update_best_path(best,job,competition))
+        self.assertEqual((best['76']['path'],best['76']['inverse']),('-r0',False))
+        self.assertFalse(module.update_best_path({}, dict(job,result_origin=None), competition))
 
     def test_diagnostic_design_is_paired_repeatable_and_covers_48_frames(self):
         lengths = {45:11, 68:32, 71:36, 80:36}
