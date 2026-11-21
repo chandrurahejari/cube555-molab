@@ -307,26 +307,24 @@ def maximum_history_depth(
     )
     if per_rank_ram <= pinned_slot_bytes + staging_bytes:
         raise ValueError("history RAM budget cannot fit pinned slots and staging")
-    usable_entries = (
-        per_rank_ram - pinned_slot_bytes - staging_bytes + per_rank_disk
-    ) // _HISTORY_ENTRY_BYTES
-    frontier_bound = 1
-    states_before_target = 0
-    saturation_depth = 0
-    while frontier_bound < plan.local_beam:
-        frontier_bound = min(plan.local_beam, frontier_bound * move_count)
-        if frontier_bound >= plan.local_beam:
-            break
-        states_before_target += frontier_bound
-        saturation_depth += 1
-    if frontier_bound < plan.local_beam:
-        max_effective_depth = usable_entries
-    elif usable_entries < states_before_target:
-        max_effective_depth = saturation_depth
-    else:
-        full_depths = (usable_entries - states_before_target) // plan.local_beam
-        max_effective_depth = saturation_depth + full_depths
-    return int(min(max_effective_depth + touch_bfs_radius, 2**32 - 1))
+    ram = (per_rank_ram - pinned_slot_bytes - staging_bytes) // _HISTORY_ENTRY_BYTES
+    disk = per_rank_disk // _HISTORY_ENTRY_BYTES
+    # Each depth is written as one contiguous record array in a single arena.
+    # Once a hypothetical layer no longer fits on disk it goes to RAM.
+    # The final table lookup does not shorten an unsuccessful search.
+    width = 1
+    layers = 0
+    while True:
+        width = min(plan.local_beam, width * move_count)
+        if width == plan.local_beam or move_count == 1:
+            return min(layers + disk // width + ram // width, 2**32 - 1)
+        if disk >= width:
+            disk -= width
+        elif ram >= width:
+            ram -= width
+        else:
+            return layers
+        layers += 1
 
 def preflight_history_runtime(
     config: PublicRunConfig,
@@ -368,7 +366,7 @@ def preflight_history_runtime(
     if per_rank_ram <= pinned_slot_bytes + staging_bytes:
         raise ValueError("history RAM budget cannot fit pinned slots and staging")
 
-    effective_depth = max(config.max_depth - config.touch_bfs_radius, 0)
+    effective_depth = config.max_depth
     frontier_bound = 1
     states_before_target = 0
     required_entries = 0
@@ -382,10 +380,12 @@ def preflight_history_runtime(
         required_entries = states_before_target
     required_history_bytes = required_entries * _HISTORY_ENTRY_BYTES
     usable_history_bytes = per_rank_ram - pinned_slot_bytes - staging_bytes + per_rank_disk
-    if required_history_bytes > usable_history_bytes:
+    capacity_depth = maximum_history_depth(plan, move_count, config.touch_bfs_radius,
+                                           history_ram_bytes, history_disk_bytes)
+    if effective_depth > capacity_depth:
         raise ValueError(
-            "static hybrid history budget is too small for the requested depth/beam/move count "
-            f"({required_history_bytes} > {usable_history_bytes} bytes per rank)"
+            f"history arenas can store {capacity_depth} complete beam layers, "
+            f"but {effective_depth} were requested"
         )
     return HistoryRuntimePreflight(
         required_history_bytes=required_history_bytes,

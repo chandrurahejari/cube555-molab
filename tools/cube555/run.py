@@ -166,6 +166,8 @@ def main():
         ram, disk = history_budgets(_available_ram_bytes(), shutil.disk_usage('/tmp').free)
         requested_depth = args.depth
         budget_depth = maximum_history_depth(plan, 30, args.touch_radius, ram, disk)
+        if not budget_depth:
+            raise RuntimeError("History arenas cannot store even the first generated layer")
         args.depth = min(requested_depth, budget_depth)
         config = configuration(args, args.pids[0], info)
         profile_evidence = f'cube4-seed-p{plan.profile_power}-outer{args.b_micro}-model{plan.runtime["model_micro"]}-cube555-unmeasured'

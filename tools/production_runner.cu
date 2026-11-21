@@ -2320,15 +2320,9 @@ struct HistoryBudgetEstimate {
 
 HistoryBudgetEstimate estimate_history_budget_entries(
     std::uint32_t depth_limit,
-    std::uint32_t solved_neighborhood_radius,
-    std::uint32_t stream2_suffix_radius,
     std::uint64_t beam_entries) {
     HistoryBudgetEstimate estimate{};
-    const std::uint32_t suffix_radius =
-        solved_neighborhood_radius > std::numeric_limits<std::uint32_t>::max() - stream2_suffix_radius
-            ? std::numeric_limits<std::uint32_t>::max()
-            : solved_neighborhood_radius + stream2_suffix_radius;
-    estimate.effective_depth = depth_limit > suffix_radius ? depth_limit - suffix_radius : 0U;
+    estimate.effective_depth = depth_limit;
     if (estimate.effective_depth == 0U || beam_entries == 0ULL) {
         return estimate;
     }
@@ -2451,8 +2445,6 @@ struct CpuCandidateHistory {
         std::uint32_t slot_count,
         std::uint32_t selected_worker_count,
         std::uint32_t depth_limit,
-        std::uint32_t solved_neighborhood_radius,
-        std::uint32_t stream2_suffix_radius,
         std::uint64_t history_ram_budget_bytes = 0,
         std::uint64_t history_disk_budget_bytes = 0,
         const std::filesystem::path& history_disk_path = {}) {
@@ -2491,8 +2483,6 @@ struct CpuCandidateHistory {
             }
             budget_estimate = estimate_history_budget_entries(
                 depth_limit,
-                solved_neighborhood_radius,
-                stream2_suffix_radius,
                 capacity_entries);
             if (budget_estimate.required_entries >
                 std::numeric_limits<std::uint64_t>::max() / sizeof(HistoryEntry)) {
@@ -5046,8 +5036,6 @@ int main(int argc, char** argv) {
         history_slot_count,
         history_worker_count,
         depth_limit,
-        solved_neighborhood.radius,
-        stream2_suffix.radius,
         history_ram_budget_per_rank,
         history_disk_budget_per_rank,
         history_disk_path);
