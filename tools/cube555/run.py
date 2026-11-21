@@ -109,6 +109,8 @@ def main():
     parser.add_argument('--depth', type=int, default=140)
     parser.add_argument('--touch-radius', type=int, default=5)
     parser.add_argument('--transformer-weight', type=float, default=0.8)
+    parser.add_argument('--score-precision', choices=('fp16', 'tpu'), default='fp16',
+                        help='Use the native FP16 heads or TPU-style BF16 heads and blend.')
     parser.add_argument('--b-micro', type=int, default=8192)
     parser.add_argument('--model-micro', type=int, default=128)
     parser.add_argument('--inference-concurrency', type=int, choices=(1, 2, 4), default=1)
@@ -134,7 +136,7 @@ def main():
         raise ValueError('choose a new output directory; previous results are never overwritten')
     args.output.mkdir(parents=True)
     start = time.monotonic()
-    summary = dict(status='preflight', pids=args.pids, beam=args.beam, results=[])
+    summary = dict(status='preflight', pids=args.pids, beam=args.beam, score_precision=args.score_precision, results=[])
     summary_path = args.output / 'run_summary.json'
     def save():
         summary['wall_seconds'] = time.monotonic() - start
@@ -155,8 +157,8 @@ def main():
         export_dir = args.output / 'export'
         manifest = export_blend(args.checkpoint or args.assets / 'q555_f1_bell2k.pt',
             args.mlp_checkpoint or args.assets / 'q555_2k_BEST.pt',
-            args.layout or args.assets / 'piece_layout_555.json', info, export_dir, args.transformer_weight)
-        model = ExportedModel('cube555-q-blend', 'fp16', manifest['script_sha256'], manifest, 'piece_transformer')
+            args.layout or args.assets / 'piece_layout_555.json', info, export_dir, args.transformer_weight, args.score_precision)
+        model = ExportedModel('cube555-q-blend', manifest['dtype'], manifest['script_sha256'], manifest, 'piece_transformer')
         plan = runtime_plan(args.beam, b_micro=args.b_micro, model_micro=args.model_micro,
                             inference_concurrency=args.inference_concurrency)
         # Reuse the existing public profiles' RAM/disk contract and explicit
@@ -171,7 +173,7 @@ def main():
             model_microbatch=plan.runtime['model_micro'], plan=asdict(plan), state_len=150,
             state_storage_len=160, state_value_pad=256, history_ram_bytes=ram, history_disk_bytes=disk,
             requested_max_depth=requested_depth, budget_max_depth=budget_depth, effective_max_depth=args.depth,
-            profile_status=profile_evidence, checkpoint_sha256=manifest['checkpoint_sha256'])
+            profile_status=profile_evidence, checkpoint_sha256=manifest['checkpoint_sha256'], score_precision=args.score_precision)
         summary.update(requested_max_depth=requested_depth, effective_max_depth=args.depth)
         if args.depth < requested_depth:
             print(f'History budget: MAX_DEPTH {requested_depth} -> {args.depth}; BEAM_WIDTH stays {args.beam}', flush=True)

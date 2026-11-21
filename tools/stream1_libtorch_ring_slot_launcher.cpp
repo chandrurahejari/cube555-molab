@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -35,6 +36,9 @@ torch::Tensor score_keys_i32(const torch::Tensor& logits) {
 struct RingSlotLauncher::Impl {
     RingSlotLauncherConfig config;
     PieceTransformerLibTorch model;
+    // WholeLayer consumes the actual TPU blend output. Other dispatchers
+    // still use the original fixed-point score ring for their histograms.
+    bool raw_tpu_scores = false;
     DispatcherRingSlotLauncher launcher{};
     std::vector<cudaEvent_t> score_ready;
     std::vector<cudaEvent_t> hash_ready;
@@ -42,6 +46,8 @@ struct RingSlotLauncher::Impl {
     explicit Impl(RingSlotLauncherConfig cfg)
         : config(std::move(cfg)),
           model(config.weight_dir, torch::Device(torch::kCUDA, config.device_index)) {
+        const char* routing = std::getenv("CUBE555_TPU_ROUTING");
+        raw_tpu_scores = routing && std::string(routing) == "1";
         if (config.inference_parallelism == 0U) {
             throw std::invalid_argument("LibTorch Stream1 launcher requires nonzero inference_parallelism");
         }
@@ -138,7 +144,9 @@ struct RingSlotLauncher::Impl {
                 logits.size(1) != static_cast<std::int64_t>(MOVE_COUNT)) {
                 throw std::runtime_error("LibTorch Stream1 logits shape does not match [micro, MOVE_COUNT]");
             }
-            torch::Tensor keys = score_keys_i32(logits);
+            torch::Tensor keys = raw_tpu_scores
+                ? logits.to(torch::kFloat32).contiguous().view(torch::kInt32)
+                : score_keys_i32(logits);
             torch::Tensor score_out = torch::from_blob(
                 config.score_ring + context.candidate_offset + static_cast<std::uint64_t>(begin) * MOVE_COUNT,
                 {static_cast<std::int64_t>(count), static_cast<std::int64_t>(MOVE_COUNT)},

@@ -49,7 +49,7 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
                   "ae84aa8dea9cc5c245e920986ec551bccf9d370122a39da847ed03bbf2d8f6e7",
                   configuration=dict(puzzle_id=puzzle_id, requested_beam=requested_beam,
                   requested_depth=requested_depth, b_micro=8192, model_micro=128, lanes=1,
-                  touch_radius=5, blend=[0.8, 0.2], solution_mode="collect",
+                  touch_radius=5, blend=[0.8, 0.2], score_precision="tpu", solution_mode="collect",
                   collect_extra_depths=1, max_collected_solutions=2000, publication=False),
                   attempts=[], max_verified_saturated_beam=None, solution=None, gpus=[],
                   queue_ids=list(queue_ids), queue_completed=[], queue_search_finished=[], queue_failed=[],
@@ -495,6 +495,7 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         args = [python, "-u", "-m", "tools.cube555.run", "--assets", inputs / "model",
                 "--competition", search_competition, "--output", folder, "--pids", pid,
                 "--beam", beam, "--depth", depth, "--touch-radius", 5, "--transformer-weight", 0.8,
+                "--score-precision", "tpu",
                 "--b-micro", 8192, "--model-micro", 128, "--inference-concurrency", 1,
                 "--reflect-mode", "off", "--solution-mode", "collect", "--collect-extra-depths", 1,
                 "--max-collected-solutions", 2000]
@@ -525,7 +526,9 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
             full_layer = (len(hardware["devices"]) == 1 and beam <= 4_194_304
                           and hardware["devices"][0]["bytes"] >= 80 * 1024**3)
             case_env["CUBE555_SINGLE_GPU_FULL_LAYER"] = str(int(full_layer))
+            case_env["CUBE555_TPU_ROUTING"] = str(int(full_layer))
             report["search_dispatch"] = "single_gpu_whole_layer" if full_layer else "sharded"
+            report["tpu_logical_ranks"] = 8 if full_layer else 0
             sanitizer_log = output / (folder.name + '-memcheck.log')
             if cuda_diagnostics != 'off':
                 # The last failing CUDA API may simply be waiting on unrelated work.

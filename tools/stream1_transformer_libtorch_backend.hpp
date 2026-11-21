@@ -236,7 +236,9 @@ struct PieceTransformerLibTorch {
                 manifest_string(manifest, "model_family") != "cube555_q_blend") {
                 throw std::runtime_error("invalid Cube555 scripted blend contract");
             }
-            // Preserve eager FP16 rounding; JIT fusion changed Q scores on T4.
+            // The reference accumulates BF16 matrix products in FP32.
+            if (manifest_dtype == "bf16") at::globalContext().setAllowBF16ReductionCuBLAS(false);
+            // Preserve eager rounding; JIT fusion changed Q scores on T4.
             torch::jit::setGraphExecutorOptimize(false);
             cube555_script = torch::jit::load((weight_dir / "cube555_blend.ts").string(), device);
             cube555_script->eval();

@@ -5107,8 +5107,9 @@ int main(int argc, char** argv) {
     if (env_u32("CUBE555_SINGLE_GPU_FULL_LAYER", 0) != 0) {
         if (!solve_bucket_mode || !ring_slot_launcher || world_size != 1U)
             throw std::runtime_error("Whole-layer search needs a single GPU, collect mode and a model launcher");
-        whole_layer = std::make_unique<WholeLayer>(plan, whole_layer_inverse_moves(host_generators));
-        std::cout << "search_dispatch=single_gpu_whole_layer" << std::endl;
+        const bool tpu_routing=env_u32("CUBE555_TPU_ROUTING",0)!=0;
+        whole_layer = std::make_unique<WholeLayer>(plan,whole_layer_inverse_moves(host_generators),tpu_routing);
+        std::cout << "search_dispatch=single_gpu_whole_layer tpu_logical_ranks=" << (tpu_routing ? 8 : 0) << std::endl;
     }
     NativeSearchCheckpoint snapshots(history, memory.current_frontier_states, plan.frontier_states,
         puzzle_id, beam, depth_limit, world_size == 1U && solve_bucket_mode && repair_tasks.size() == 1U);
@@ -5159,7 +5160,7 @@ int main(int argc, char** argv) {
         generated_track_request = tracked_solution.generated_request_for_depth(depth);
 #endif
         const DepthDispatchState state = whole_layer
-            ? whole_layer->expand(memory, streams.stream1_lanes.at(0), *ring_slot_launcher, frontier_size)
+            ? whole_layer->expand(memory, streams.stream1_lanes.at(0), *ring_slot_launcher, frontier_size,tables.generators)
             : run_depth_cuda_graphs(
             plan,
             memory,
@@ -5755,6 +5756,7 @@ int main(int argc, char** argv) {
         if (whole_layer) {
             std::cout << "whole_layer_depth=" << depth
                       << " generated=" << final_state.whole_layer_generated
+                      << " sent=" << final_state.whole_layer_sent
                       << " unique=" << final_state.whole_layer_unique
                       << " rejected_history_or_inverse=" << final_state.whole_layer_rejected
                       << " kept=" << final_state.next_frontier_size

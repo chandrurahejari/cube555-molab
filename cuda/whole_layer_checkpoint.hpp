@@ -34,7 +34,9 @@ inline std::uint64_t file_bytes(const Header& header, std::uint64_t width,
         bytes += header[i] * sizeof(Hash128);
     }
     const auto latest = (header[4]+3) % 4;
-    if (header[5+latest] != frontier_count)
+    const bool tpu_seed = header[3]==MOVE_COUNT && header[4]==0 &&
+        std::all_of(header.begin()+5,header.end(),[](auto n){return n==0;});
+    if (!tpu_seed && header[5+latest] != frontier_count)
         throw std::runtime_error("Checkpoint frontier disagrees with the latest history row");
     const auto active = std::count_if(header.begin()+5, header.end(), [](auto n) { return n != 0; });
     if (active < 4 && (header[4] != static_cast<std::uint64_t>(active) ||
@@ -104,12 +106,14 @@ inline void load_whole_layer_history(const std::filesystem::path& path, std::uin
     file.read(reinterpret_cast<char*>(header.data()), sizeof(header));
     if (std::filesystem::file_size(path) != file_bytes(header, width, frontier_count))
         throw std::runtime_error("Wrong whole-layer checkpoint length");
+    const bool seed=std::all_of(header.begin()+5,header.end(),[](auto n){return n==0;});
     std::vector<char> buffer(block_bytes);
     for (std::uint32_t offset=0; offset<frontier_count;) {
         const auto n=std::min<std::size_t>(buffer.size(), frontier_count-offset);
         file.read(buffer.data(), n);
-        if (std::any_of(buffer.begin(),buffer.begin()+n,[](char m) {
-                    return static_cast<unsigned char>(m) >= MOVE_COUNT;
+        if (std::any_of(buffer.begin(),buffer.begin()+n,[seed](char m) {
+                    const auto move=static_cast<unsigned char>(m);
+                    return seed ? move != UINT8_MAX : move >= MOVE_COUNT;
                 })) throw std::runtime_error("Checkpoint contains an invalid incoming move");
         BEAM_CUDA_CHECK(cudaMemcpy(incoming_device+offset,buffer.data(),n,cudaMemcpyHostToDevice));
         offset += static_cast<std::uint32_t>(n);

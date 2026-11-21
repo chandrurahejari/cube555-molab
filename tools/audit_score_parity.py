@@ -102,6 +102,8 @@ def main():
     parser.add_argument("--output", type=Path, help="Save full report, including the list of samples")
     args = parser.parse_args()
     torch.set_num_threads(4)
+    if args.torch_device == "cuda":
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     paths = [args.artifacts / name for name in ("q555_f1_bell2k.pt", "q555_2k_BEST.pt")]
     layout = args.artifacts / "piece_layout_555.json"
     jax_path = args.artifacts / "jax_model.py"
@@ -127,6 +129,8 @@ def main():
         }
         if name in ("fp16", "tpu"):
             native = scores[-1]
+            if name == "tpu" and not np.array_equal(native, torch.from_numpy(native).bfloat16().float().numpy()):
+                raise AssertionError("The native TPU-mode blend must return BF16-representable scores.")
             keys = np.rint(np.clip(native, 0, 300) * 1024) / 1024
             result[name + "_quantization"] = {
                 "minimum": float(native.min()), "maximum": float(native.max()),

@@ -227,7 +227,7 @@ def locate_or_build_runner(output_dir: Path, puzzle_info_json: Path | None = Non
         configure.append(f"-D{key}={value}")
     _run_logged(configure, logs / "cmake-configure.log", redactions=private_paths)
     verify_selection = os.environ.get("CUBE555_SINGLE_GPU_FULL_LAYER") == "1"
-    targets = [target, "whole_layer_filter_tests"] if verify_selection else [target]
+    targets = [target, "whole_layer_filter_tests", "tpu_routing_tests"] if verify_selection else [target]
     _run_logged(
         ["cmake", "--build", build, "--target", *targets, "-j", "2"],
         logs / "cmake-build.log", redactions=private_paths,
@@ -236,6 +236,7 @@ def locate_or_build_runner(output_dir: Path, puzzle_info_json: Path | None = Non
         # Exercise the same compiled CUDA selector on this GPU, including a
         # checkpoint round-trip, before spending a full session on inference.
         _run_logged([build / "whole_layer_filter_tests"], logs / "cmake-layer-test.log", redactions=private_paths)
+        _run_logged([build / "tpu_routing_tests"], logs / "cmake-tpu-routing-test.log", redactions=private_paths)
     runner = (build / target).resolve()
     if not runner.is_file() or not runner.is_absolute():
         raise RuntimeError("Release SM75 runner was not materialized")
