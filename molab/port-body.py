@@ -19,6 +19,7 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
     import tarfile
     import time
     import urllib.request
+    import zipfile
     import uuid
 
     __SYMMETRY_HELPERS__
@@ -29,6 +30,7 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
     commit = __SOURCE_COMMIT__
     source_hash = __SOURCE_SHA256__
     source_blob = __SOURCE_BLOB__
+    source_manifest = __SOURCE_MANIFEST__
     input_data_hash = __INPUT_DATA_SHA256__
     input_blob = __INPUT_DATA_BLOB__
     weights_url = "https://api.kaggle.com/v1/datasets/download/artgor/cube555-tpu-artifacts/"
@@ -307,7 +309,34 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
 
     def prepare_repo():
         repo = output / "source"
-        unpack_bundle(source_blob, source_hash, repo)
+        if source_blob:
+            unpack_bundle(source_blob, source_hash, repo)
+        else:
+            if hashlib.sha256(json.dumps(source_manifest, sort_keys=True).encode()).hexdigest() != source_hash:
+                raise ValueError("Native source manifest checksum mismatch")
+            url = "https://codeload.github.com/chandrurahejari/cube555-molab/zip/" + commit
+            prefix = "cube555-molab-" + commit + "/"
+            with urllib.request.urlopen(url, timeout=120) as response:
+                with zipfile.ZipFile(io.BytesIO(response.read())) as archive:
+                    for name, sha in source_manifest.items():
+                        data = archive.read(prefix + name)
+                        if hashlib.sha256(data).hexdigest() != sha:
+                            raise ValueError("Native source checksum mismatch: " + name)
+                        target = repo / name
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(data)
+            revision = json.loads((repo / "UPSTREAM.json").read_text())["cutlass_commit"]
+            cutlass = repo / "external/cutlass"
+            with zipfile.ZipFile(repo / ("vendor/cutlass-" + revision[:7] + ".zip")) as headers:
+                for name in headers.namelist():
+                    if name.endswith("/"):
+                        continue
+                    target = (cutlass / name).resolve()
+                    if not target.is_relative_to(cutlass):
+                        raise ValueError("Invalid vendored CUTLASS member")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(headers.read(name))
+            (cutlass / "CUBE555_CUTLASS_REVISION").write_text(revision)
         env["CAYLEYPY_CUTLASS_DIR"] = str(repo / "external/cutlass")
         report["source_provenance"] = json.loads((repo / "UPSTREAM.json").read_text(encoding="utf-8"))
         return repo

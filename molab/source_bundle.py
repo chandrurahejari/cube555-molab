@@ -40,6 +40,15 @@ def pack_sources(repo, commit):
     return encoded(output.getvalue())
 
 
+def source_manifest(repo, commit):
+    # Include only files the solver owns. Hash the binary vendor archive as
+    # well, before expanding CUTLASS in the notebook.
+    packed = git(repo, "archive", "--format=zip", commit, "--", *SOURCE_PATHS)
+    with zipfile.ZipFile(io.BytesIO(packed)) as source:
+        return {entry.filename: hashlib.sha256(source.read(entry)).hexdigest()
+                for entry in source.infolist() if not entry.is_dir()}
+
+
 def pack_small_inputs(path):
     # Competition data stays in the notebook built for this user. Weights are
     # downloaded by their original filenames and checked against this manifest.

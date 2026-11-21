@@ -9,7 +9,7 @@ import base64
 import zlib
 import uuid
 import os
-from source_bundle import git, pack_sources, pack_small_inputs
+from source_bundle import git, pack_sources, pack_small_inputs, source_manifest
 
 root = Path(__file__).parent
 header = '''# /// script
@@ -116,12 +116,16 @@ def embedded_body():
     body = body.replace("    __CHECKPOINT_HELPERS__", textwrap.indent(checkpoint, '    '))
     repo = root.parent
     commit = git(repo, "rev-parse", "HEAD").decode().strip()
-    source_hash, source = pack_sources(repo, commit)
+    manifest = source_manifest(repo, commit)
+    source = ""
+    source_hash = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    if os.environ.get("CUBE555_EMBED_SOURCE") == "1":
+        source_hash, source = pack_sources(repo, commit)
     inputs = Path(os.environ.get("CUBE555_INPUTS_ARCHIVE",
                  repo.parent / "work/cube555-source/cube555-inputs-audit.zip"))
     input_hash, input_data = pack_small_inputs(inputs)
     for key, value in {"__SOURCE_COMMIT__": commit, "__SOURCE_SHA256__": source_hash,
-                       "__SOURCE_BLOB__": source, "__INPUT_DATA_SHA256__": input_hash,
+                       "__SOURCE_BLOB__": source, "__SOURCE_MANIFEST__": manifest, "__INPUT_DATA_SHA256__": input_hash,
                        "__INPUT_DATA_BLOB__": input_data}.items():
         body = body.replace(key, repr(value))
     return body
