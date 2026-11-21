@@ -345,6 +345,9 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         root = output / "inputs"
         unpack_bundle(input_blob, input_data_hash, root)
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        original = cache / ("inputs-" + archive_sha + ".zip")
+        original_url = ("https://github.com/TryDotAtwo/MultiGPUBeamSearch/releases/download/"
+                        "cube555-inputs-20261001/cube555-inputs.zip")
         for name, entry in manifest.items():
             path = (root / name).resolve()
             if not path.is_relative_to(root):
@@ -352,9 +355,27 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
             if name.endswith(".pt"):
                 weight = cache / "weights" / entry["sha256"]
                 weight.parent.mkdir(parents=True, exist_ok=True)
-                download(weights_url + path.name + "?datasetVersionNumber=3", weight, entry["sha256"])
+                try:
+                    download(weights_url + path.name + "?datasetVersionNumber=3", weight, entry["sha256"])
+                except (OSError, ValueError) as exc:
+                    # Some artifact responses are truncated. Only extract the
+                    # named tensor from the checksum-pinned original dataset.
+                    report.setdefault("weight_fallbacks", {})[name] = str(exc)
+                    download(original_url, original, archive_sha)
+                    tmp = weight.with_name(weight.name + "." + runid + ".partial")
+                    try:
+                        with zipfile.ZipFile(original) as archive, archive.open(name) as src, tmp.open("wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        if tmp.stat().st_size != entry["bytes"] or digest(tmp) != entry["sha256"]:
+                            raise ValueError("Original model tensor checksum mismatch: " + name)
+                        tmp.replace(weight)
+                    finally:
+                        tmp.unlink(missing_ok=True)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                os.link(weight, path)
+                try:
+                    os.link(weight, path)
+                except OSError:
+                    shutil.copyfile(weight, path)
             if path.stat().st_size != entry["bytes"] or digest(path) != entry["sha256"]:
                 raise ValueError("Input checksum mismatch: " + name)
         report["inputs"] = manifest
