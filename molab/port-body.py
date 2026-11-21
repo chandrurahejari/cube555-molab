@@ -780,6 +780,11 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
                         raise RuntimeError("Independent 150-sticker replay failed")
                     row["solution"] = dict(puzzle_id=pid, path=moves, length=len(tokens),
                                            verified=True, requested_beam=beam, effective_beam=effective)
+                    prefix = int(chosen["found_depth"])
+                    tail = int(chosen["touch_depth"])
+                    if prefix < 0 or not 0 <= tail <= 5 or prefix + tail != len(tokens):
+                        raise RuntimeError("Invalid search-prefix and radius-5 suffix lengths in solutions.csv")
+                    row["solution"].update(found_depth=prefix, touch_depth=tail, touch_radius=5)
                     row['solution']['replay_steps'] = replay_steps
                     row["solution"].update(symmetry_index=symmetry, inverse=inverse)
                     if row["baseline_length"] is not None:
