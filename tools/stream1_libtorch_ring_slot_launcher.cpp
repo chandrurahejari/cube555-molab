@@ -2,6 +2,7 @@
 
 #include "cuda_check.hpp"
 #include "stream1_transformer_libtorch_backend.hpp"
+#include "cube555_score_fixture.hpp"
 #include "../src/config.hpp"
 
 #include <c10/cuda/CUDAGuard.h>
@@ -10,7 +11,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -71,6 +74,7 @@ struct RingSlotLauncher::Impl {
         require_not_null(config.generators, "generators");
         require_not_null(config.central_state, "central_state");
         require_not_null(config.zobrist, "zobrist");
+        if (raw_tpu_scores) check_tpu_scores();
         score_ready.resize(config.inference_parallelism, nullptr);
         hash_ready.resize(config.inference_parallelism, nullptr);
         try {
@@ -89,6 +93,34 @@ struct RingSlotLauncher::Impl {
 
     ~Impl() {
         destroy_events();
+    }
+
+    void check_tpu_scores() {
+        torch::NoGradGuard no_grad;
+        // Pass these synthetic scrambles through the same loaded module and
+        // 160-byte input layout the actual search will use on this device.
+        auto host = torch::zeros({8, static_cast<std::int64_t>(STATE_STORAGE_LEN)}, torch::kUInt8);
+        for (unsigned row=0; row<8; ++row)
+            std::copy_n(cube555_probe::states[row],150,host.data_ptr<std::uint8_t>()+row*STATE_STORAGE_LEN);
+        auto gpu = host.to(torch::Device(torch::kCUDA,config.device_index));
+        auto scores = model.forward(gpu).to(torch::kCPU,torch::kFloat32).contiguous();
+        if (scores.dim()!=2 || scores.size(0)!=8 || scores.size(1)!=30)
+            throw std::runtime_error("Unexpected probe shape for the Cube555 TPU blend");
+        const float* actual=scores.data_ptr<float>();
+        float max_error=0;
+        unsigned matching_minima=0;
+        for (unsigned row=0; row<8; ++row) {
+            const auto* expected=cube555_probe::q[row];
+            auto p=actual+30*row;
+            for (unsigned move=0; move<30; ++move) {
+                if (!std::isfinite(p[move])) throw std::runtime_error("Nonfinite Q in the Cube555 GPU model");
+                max_error=std::max(max_error,std::abs(p[move]-expected[move]));
+            }
+            auto best=std::min_element(p,p+30)-p;
+            matching_minima+=expected[best]==*std::min_element(expected,expected+30);
+        }
+        std::cout << "tpu_model_probe states=8 actions=240 max_error=" << max_error
+                  << " matched_best_with_ties=" << matching_minima << std::endl;
     }
 
     void destroy_events() noexcept {

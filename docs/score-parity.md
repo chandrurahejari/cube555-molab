@@ -24,3 +24,15 @@ The submission used here had score 100284. Every selected path was replayed agai
 In FP32 all three scored outputs also agreed on the best three moves for all 128 states. In mixed precision, 126 of the 128 FP16 blend winners attained a minimum JAX BF16 score when ties were allowed. Ranking all 3,840 candidates together gave 116 shared candidates among the best 128. The native FP16 blend ranged from 4.8570 to 52.8938. All values were finite and within the native key range of 0 to 300. Rounding to units of 1/1024 preserved the first-ranked move on every sampled state.
 
 These measurements check how both implementations rank identical verified states. Solving a 100- or 110-move cube still requires a complete beam search and replay of the returned path. The reported rankings use stable index ordering to break ties. Global candidate comparisons across samples measure sensitivity to score precision and do not represent a single search frontier.
+
+## TPU precision and eight logical ranks on Molab
+
+The Molab notebook selects `--score-precision tpu`. It exports both heads in BF16, applies the reference ResMLP normalization and rounds the FP32 weighted sum back to BF16. The CUDA selector ranks signed BF16 values directly. On the same 128 CPU inputs, the new blend agreed with the first-ranked JAX move 125 times and selected a tied JAX minimum 126 times. Maximum absolute Q error was 0.25. Among the best 384 actions across the sample, 370 were shared with JAX, versus 353 with the original FP16 export.
+
+At a beam width of 4,194,304 the single GPU emulates eight logical ranks, each with 524,288 slots. The sender keeps at most 131,072 candidates per source–destination pair. The receiver deduplicates in the reference hash order and keeps its own lowest-Q candidates. The goal table replays paths in the original cube frame. The empty padding entries of the TPU arrays are excluded from the compact GPU frontiers.
+
+Before the first layer, the native runner compares its loaded GPU TorchScript module against 240 saved JAX scores from eight synthetic scrambles. Its log records `tpu_model_probe` with the largest absolute error and number of predicted actions attaining the reference minimum. To regenerate the probe using the same Kaggle artifacts:
+
+```sh
+python tools/audit_score_parity.py --artifacts ./artifacts --competition ./competition.zip --write-runtime-fixture tools/cube555_score_fixture.hpp
+```

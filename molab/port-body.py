@@ -391,7 +391,7 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         for match in re.finditer(r"depth_done=(\d+) depth_sec=([\d.eE+\-]+)", text):
             records.setdefault(int(match[1]), {})["seconds"] = float(match[2])
         for line in text.splitlines():
-            if line.startswith("whole_layer_depth="):
+            if "whole_layer_depth=" in line:
                 values = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)}
                 if "q_cutoff_key" in values:
                     records.setdefault(values.pop("whole_layer_depth"), {})["selection"] = values
@@ -692,6 +692,10 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
                 final_streams[int(match[1])] = path
         for rank, path in final_streams.items():
             final_text = path.read_text(errors="replace")
+            probe = re.search(r"tpu_model_probe states=(\d+) actions=(\d+) max_error=([\d.eE+\-]+) matched_best_with_ties=(\d+)", final_text)
+            if probe:
+                report["gpu_model_probe"] = dict(states=int(probe[1]), actions=int(probe[2]),
+                                                 max_abs_error=float(probe[3]), matched_best_with_ties=int(probe[4]))
             merge_layer_samples(layer_samples, rank, final_text)
             if "CUBE555_TRACE_PATH" in case_env:
                 capture_trace(final_text)
