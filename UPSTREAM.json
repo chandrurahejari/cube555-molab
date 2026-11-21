@@ -1,0 +1,6 @@
+{
+  "solver": "TryDotAtwo/MultiGPUBeamSearch",
+  "solver_commit": "a152738740044b683e1fe6e759ccb5b4b095d188",
+  "cutlass": "NVIDIA/cutlass",
+  "cutlass_commit": "afa1772203677c5118fcd82537a9c8fefbcc7008"
+}

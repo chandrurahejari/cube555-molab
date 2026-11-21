@@ -1,0 +1,6 @@
+__pycache__/
+build/
+runs/
+*.pt
+*.env
+drive-config.json
