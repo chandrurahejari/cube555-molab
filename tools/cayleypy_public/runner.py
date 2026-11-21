@@ -33,7 +33,8 @@ CollectionStatus = Literal["first_solution", "depth_reached", "capacity_reached"
 LogSanitizer = Callable[[str], str]
 _UINT32_MAX = 2**32 - 1
 _SOLVED_RECORD_BYTES = 32 + 4 + 4
-_T4_DEVICE_BYTES = 16 * 1024**3
+_T4_DEVICE_BYTES = int(os.environ["CUBE555_DEVICE_BYTES"])
+_MOLAB_RANKS = int(os.environ["CUBE555_WORLD_SIZE"])
 _T4_HEADROOM_BYTES = 768 * 1024**2
 _MAX_GATHER_RECORDS_PER_CHUNK = 65_536
 _PROCESS_STOP_TIMEOUT_SECONDS = 5.0
@@ -88,7 +89,7 @@ class RunnerInvocation:
     env: dict[str, str]
     result_tsv: Path | None
     combined_log: Path
-    rank_logs: tuple[Path, Path]
+    rank_logs: tuple[Path, ...]
     torchrun_log_dir: Path
     history_dir: Path
     puzzle_id: int
@@ -131,7 +132,7 @@ class RunArtifacts:
     solution_records: tuple[SolutionRecord, ...]
     submission: pd.DataFrame
     combined_logs: tuple[Path, ...]
-    rank_logs: tuple[tuple[Path, Path], ...]
+    rank_logs: tuple[tuple[Path, ...], ...]
     return_codes: tuple[int, ...]
     timing_summaries: tuple[float, ...]
     collection_statuses: tuple[CollectionStatus, ...]
@@ -296,8 +297,8 @@ def maximum_history_depth(
         raise ValueError("move_count must be positive and touch_bfs_radius nonnegative")
     if history_ram_bytes <= 0 or history_disk_bytes <= 0:
         raise ValueError("history budgets must be positive")
-    per_rank_ram = history_ram_bytes // 2
-    per_rank_disk = history_disk_bytes // 2
+    per_rank_ram = history_ram_bytes // _MOLAB_RANKS
+    per_rank_disk = history_disk_bytes // _MOLAB_RANKS
     pinned_slot_bytes = _HISTORY_SLOT_COUNT * plan.local_beam * _CANDIDATE_META_BYTES
     staging_bytes = (
         _HISTORY_SLOT_COUNT
@@ -358,8 +359,8 @@ def preflight_history_runtime(
             f"({tmp_free_bytes} < {history_disk_bytes} bytes)"
         )
 
-    per_rank_ram = history_ram_bytes // 2
-    per_rank_disk = history_disk_bytes // 2
+    per_rank_ram = history_ram_bytes // _MOLAB_RANKS
+    per_rank_disk = history_disk_bytes // _MOLAB_RANKS
     pinned_slot_bytes = _HISTORY_SLOT_COUNT * plan.local_beam * _CANDIDATE_META_BYTES
     staging_bytes = (
         _HISTORY_SLOT_COUNT * min(plan.local_beam, _HISTORY_STAGING_ENTRIES) * _HISTORY_ENTRY_BYTES
@@ -486,11 +487,13 @@ def build_runner_invocation(
         "BEAM_HISTORY_DISK_PATH": history_dir.as_posix(),
     })
     env["BEAM_NCCL_ID_FILE"] = str(run_root / "nccl-id.bin")
+    if config.debug_path_trace and os.environ.get("CUBE555_TRACE_PATH"):
+        env["BEAM_TRACK_SOLUTION_PATH"] = os.environ["CUBE555_TRACE_PATH"]
     if result_tsv is not None:
         snapshot_capacity = derive_solved_result_capacity(
             plan, move_count, 160 if model is not None and model.manifest.get("state_len") == 150 else 128,
             max_collected_solutions=config.max_collected_solutions, max_depth=config.max_depth)
-        derive_gather_chunk_plan(plan.local_beam, snapshot_capacity)
+        derive_gather_chunk_plan(plan.local_beam, snapshot_capacity, _MOLAB_RANKS)
         env.update({
             "BEAM_SOLVE_BUCKET_MODE": "1",
             "BEAM_SOLVE_BUCKET_STOP_DEPTH": str(config.collect_until_depth),
@@ -500,7 +503,7 @@ def build_runner_invocation(
             "BEAM_SOLVE_BUCKET_RESULT_TSV": str(result_tsv),
         })
     command = (
-        "python", "-m", "torch.distributed.run", "--nproc-per-node=2",
+        sys.executable, "-m", "torch.distributed.run", f"--nproc-per-node={_MOLAB_RANKS}",
         "--rdzv-backend=c10d", f"--rdzv-endpoint=127.0.0.1:{_free_port()}", f"--rdzv-id={run_id}",
         f"--log-dir={torchrun_log_dir}", "--redirects=3", "--tee=0:3", "--no-python", runner_path,
         str(puzzle_id), str(config.max_depth), str(config.beam_width),
@@ -510,7 +513,7 @@ def build_runner_invocation(
         env=env,
         result_tsv=result_tsv,
         combined_log=run_root / "combined.log",
-        rank_logs=(run_root / "rank-0.log", run_root / "rank-1.log"),
+        rank_logs=tuple(run_root / f"rank-{rank}.log" for rank in range(_MOLAB_RANKS)),
         torchrun_log_dir=torchrun_log_dir,
         history_dir=history_dir,
         puzzle_id=puzzle_id,

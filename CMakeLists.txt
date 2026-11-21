@@ -116,6 +116,7 @@ add_library(beam_cuda
     cuda/threshold.cu
     cuda/final_materialize.cu
     cuda/dispatcher.cu
+    cuda/whole_layer.cu
     cuda/static_memory.cu
     cuda/runtime_config.cpp
 )

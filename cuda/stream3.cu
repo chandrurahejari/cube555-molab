@@ -764,7 +764,11 @@ __global__ void stream3_partition_scatter_kernel(
     const std::uint32_t source_base = shard_offsets[shard];
     const std::uint32_t write_limit = shard_counts[shard];
     const std::uint32_t shard_capacity = shard_capacity_candidates;
-    const std::uint32_t dirty_base = clean_count[physical_shard] + dirty_count[physical_shard];
+    __shared__ std::uint32_t dirty_base;
+    if (threadIdx.x == 0) {
+        dirty_base = clean_count[physical_shard] + dirty_count[physical_shard];
+    }
+    __syncthreads();
     const std::uint32_t spill_base = spill_offsets[shard];
     const std::uint32_t active = *global_spill_active_index & 1U;
     CandidateMeta* global_spill_buffer =

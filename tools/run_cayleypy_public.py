@@ -42,7 +42,6 @@ from tools.kaggle_t4_mlp_profiles import select_profile
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _MLP_PROFILE_REGISTRY = _REPO_ROOT / "configs" / "kaggle_t4_mlp_profiles.json"
 _TRANSFORMER_PROFILE_REGISTRY = _REPO_ROOT / "configs" / "kaggle_t4_transformer_profiles.json"
-_CUTLASS_URL = "https://github.com/NVIDIA/cutlass.git"
 _CUTLASS_REV = "afa1772203677c5118fcd82537a9c8fefbcc7008"
 _HISTORY_RAM_MAX_BYTES = 29_000_000_000
 _HISTORY_RAM_HEADROOM_BYTES = 1_500_000_000
@@ -76,12 +75,10 @@ def _derive_history_budgets(available_ram_bytes: int, tmp_free_bytes: int) -> tu
         _HISTORY_RAM_MAX_BYTES,
         available_ram_bytes - _HISTORY_RAM_HEADROOM_BYTES,
     )
-    if tmp_free_bytes < _HISTORY_DISK_BYTES:
-        raise ValueError(
-            f"/tmp free disk is smaller than the history disk budget "
-            f"({tmp_free_bytes} < {_HISTORY_DISK_BYTES} bytes)"
-        )
-    return ram_budget, _HISTORY_DISK_BYTES
+    disk = min(_HISTORY_DISK_BYTES, tmp_free_bytes - 2 * 1024**3)
+    if disk <= 0:
+        raise ValueError("History storage needs over 2 GiB free in /tmp")
+    return ram_budget, disk
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -124,18 +121,11 @@ def _public_error(error: BaseException, config: PublicRunConfig | None = None) -
 
 
 def validate_t4_hardware() -> list[str]:
-    """Require the exact public runtime target before checkpoint or build work."""
-    completed = subprocess.run(
-        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    names = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-    if len(names) != 2 or any(name not in {"Tesla T4", "NVIDIA T4"} for name in names):
-        raise RuntimeError(f"public runner requires exactly two Tesla T4 GPUs; observed {names!r}")
-    return names
+    import torch
+    ranks = int(os.environ["CUBE555_WORLD_SIZE"])
+    if ranks not in (1, 2) or torch.cuda.device_count() < ranks:
+        raise RuntimeError("Active CUDA devices do not match configured Molab ranks")
+    return [torch.cuda.get_device_name(i) for i in range(ranks)]
 
 
 def _sanitize_log(text: str, redactions: Sequence[Path] = ()) -> str:
@@ -184,50 +174,24 @@ def _run_logged(command: Sequence[object], log_path: Path, *, cwd: Path | None =
         raise RuntimeError(f"command failed with exit code {completed.returncode}; see {log_path.name}")
 
 
-def _git_stdout(arguments: Sequence[object], *, cwd: Path) -> str:
-    completed = subprocess.run(
-        ["git", *map(str, arguments)], cwd=str(cwd), check=True, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    return completed.stdout.strip()
-
-
 def locate_or_build_runner(output_dir: Path, puzzle_info_json: Path | None = None, *, backend: str = "mlp", config: PublicRunConfig | None = None) -> Path:
     """Build the existing runner in Release mode for T4 (SM75), without source edits."""
     logs = output_dir / "logs"
-    cutlass = Path(os.environ.get("CAYLEYPY_CUTLASS_DIR", "/tmp/cayleypy_public_cutlass"))
+    cutlass = Path(os.environ.get("CAYLEYPY_CUTLASS_DIR", _REPO_ROOT / "external/cutlass"))
     default_build = f"/tmp/cayleypy_public_build_sm75_{backend}"
     build = Path(os.environ.get("CAYLEYPY_BUILD_DIR", default_build))
     private_paths = tuple(path for path in (cutlass, build, puzzle_info_json) if path is not None)
-    if not cutlass.exists():
-        _run_logged(
-            ["git", "clone", "--filter=blob:none", "--no-checkout", _CUTLASS_URL, cutlass],
-            logs / "cutlass-clone.log", redactions=private_paths,
-        )
-    if not (cutlass / ".git").exists():
-        raise RuntimeError("CUTLASS path exists but is not a Git checkout")
-    try:
-        head = _git_stdout(["rev-parse", "HEAD"], cwd=cutlass)
-    except subprocess.CalledProcessError:
-        head = ""
-    if head != _CUTLASS_REV:
-        _run_logged(
-            ["git", "fetch", "--depth", "1", "origin", _CUTLASS_REV],
-            logs / "cutlass-fetch.log", cwd=cutlass, redactions=private_paths,
-        )
-        _run_logged(
-            ["git", "checkout", "--detach", "FETCH_HEAD"],
-            logs / "cutlass-checkout.log", cwd=cutlass, redactions=private_paths,
-        )
-    if _git_stdout(["rev-parse", "HEAD"], cwd=cutlass) != _CUTLASS_REV:
-        raise RuntimeError("CUTLASS checkout does not match the pinned revision")
+    marker = cutlass / "CUBE555_CUTLASS_REVISION"
+    if (not marker.is_file() or marker.read_text().strip() != _CUTLASS_REV
+            or not (cutlass / "include/cutlass/cutlass.h").is_file()):
+        raise RuntimeError(f"The notebook source bundle must include CUTLASS {_CUTLASS_REV}")
 
     if backend not in {"mlp", "piece_transformer"}:
         raise ValueError(f"unsupported Stream1 backend: {backend}")
     target = "production_runner" if backend == "mlp" else "production_runner_libtorch_stream1"
     configure: list[object] = [
         "cmake", "-S", _REPO_ROOT, "-B", build, "-GNinja",
-        "-DCMAKE_BUILD_TYPE=Release", "-DBEAM_CUDA_ARCHITECTURES=75",
+        "-DCMAKE_BUILD_TYPE=Release", f"-DBEAM_CUDA_ARCHITECTURES={os.environ['CUBE555_CUDA_ARCH']}",
         f"-DCUTLASS_DIR={cutlass}",
         f"-DBEAM_ENABLE_DEBUG={'ON' if config is None or config.enable_debug else 'OFF'}",
         f"-DBEAM_ENABLE_DEPTH_LOGS={'ON' if config is None or config.enable_depth_logs else 'OFF'}",
@@ -244,7 +208,7 @@ def locate_or_build_runner(output_dir: Path, puzzle_info_json: Path | None = Non
     ]
     if backend == "piece_transformer":
         import torch
-        nccl_root = Path(torch.__file__).resolve().parents[1] / "nvidia" / "nccl"
+        nccl_root = Path(os.environ.get("CUBE555_NCCL_ROOT", str(Path(torch.__file__).resolve().parents[1] / "nvidia" / "nccl")))
         nccl_candidates = sorted((nccl_root / "lib").glob("libnccl.so*"))
         nccl_include = nccl_root / "include"
         if not nccl_candidates or not (nccl_include / "nccl.h").is_file():
@@ -258,6 +222,9 @@ def locate_or_build_runner(output_dir: Path, puzzle_info_json: Path | None = Non
         os.environ["LD_LIBRARY_PATH"] = f"{nccl_library.parent}:{os.environ.get('LD_LIBRARY_PATH', '')}"
     if puzzle_info_json is not None:
         configure.append(f"-DBEAM_PUZZLE_INFO_JSON={puzzle_info_json.resolve()}")
+    # NVIDIA pip packages may omit linker-name symlinks needed by FindCUDA.
+    for key, value in json.loads(os.environ.get("CUBE555_CUDA_CMAKE_ARGS", "{}" )).items():
+        configure.append(f"-D{key}={value}")
     _run_logged(configure, logs / "cmake-configure.log", redactions=private_paths)
     _run_logged(
         ["cmake", "--build", build, "--target", target, "-j", "2"],
@@ -347,7 +314,7 @@ def _invocation_rows(artifacts: RunArtifacts, output_dir: Path) -> list[dict[str
             ),
             "combined_log": _relative(combined, output_dir) if combined is not None else None,
             "rank0_log": _relative(rank_pair[0], output_dir) if rank_pair is not None else None,
-            "rank1_log": _relative(rank_pair[1], output_dir) if rank_pair is not None else None,
+            "rank1_log": _relative(rank_pair[1], output_dir) if rank_pair and len(rank_pair) > 1 else None,
         })
     return rows
 
@@ -432,7 +399,7 @@ def _publication_context(
         "profile_evidence_version": profile.get("profile_registry_schema_version"),
         "profile_power": plan.profile_power,
         "model_class": plan.model_class,
-        "world_size": 2,
+        "world_size": int(os.environ["CUBE555_WORLD_SIZE"]),
     }
     return {
         "run_id": f"run-{uuid.uuid4().hex}",
@@ -461,7 +428,7 @@ def _publication_context(
         },
         "hardware": {
             "platform": "kaggle", "gpu_names": list(hardware_names),
-            "accelerator_count": 2, "world_size": 2,
+            "accelerator_count": int(os.environ["CUBE555_WORLD_SIZE"]), "world_size": int(os.environ["CUBE555_WORLD_SIZE"]),
         },
         "timings": {
             "solve_us": max(0, round(solve_seconds * 1_000_000)),
@@ -670,7 +637,7 @@ def _summary_base(
     plan: RuntimePlan,
 ) -> dict[str, object]:
     return {
-        "hardware": {"gpu_names": list(hardware_names), "world_size": 2},
+        "hardware": {"gpu_names": list(hardware_names), "world_size": int(os.environ["CUBE555_WORLD_SIZE"])},
         "model": {
             "format": model.format, "dtype": model.dtype,
             "checkpoint_sha256": model.checkpoint_sha256,

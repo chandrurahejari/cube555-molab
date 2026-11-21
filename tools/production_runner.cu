@@ -1,6 +1,7 @@
 #include "cuda_check.hpp"
 #include "stream1_weight_io.hpp"
 #include "../cuda/dispatcher.hpp"
+#include "../cuda/whole_layer.hpp"
 #include "../cuda/runtime_config.hpp"
 #include "../src/hash.hpp"
 #include "../src/state.hpp"
@@ -3070,6 +3071,152 @@ struct CpuCandidateHistory {
     }
 };
 
+// Layer-boundary snapshots for the single-rank Cube555 collect runner.
+// Copy immutable packed history in blocks (the disk arena itself may be sparse).
+class NativeSearchCheckpoint {
+    CpuCandidateHistory& history;
+    State128* const states;
+    const std::uint64_t capacity, puzzle, beam;
+    const std::uint32_t limit;
+    const std::filesystem::path root, resume;
+    const std::string identity;
+    const std::chrono::seconds interval;
+    std::chrono::steady_clock::time_point next;
+    static constexpr std::size_t block = 1 << 20;
+
+    static void copy_bytes(std::istream& src, std::ostream& dst, std::uint64_t bytes) {
+        std::vector<char> buf(block);
+        while (bytes) {
+            auto n = std::min<std::uint64_t>(buf.size(), bytes);
+            src.read(buf.data(), n);
+            dst.write(buf.data(), n);
+            bytes -= n;
+        }
+    }
+    static std::fstream open_file(const std::filesystem::path& path, std::ios::openmode mode) {
+        std::fstream file;
+        file.exceptions(std::ios::badbit | std::ios::failbit);
+        file.open(path, mode | std::ios::binary);
+        return file;
+    }
+    void transfer_frontier(const std::filesystem::path& path, std::uint64_t count, bool writing) {
+        if (count > capacity || !count) throw std::runtime_error("Invalid checkpoint frontier count");
+        auto file = open_file(path, writing ? (std::ios::out | std::ios::trunc) : std::ios::in);
+        const std::size_t units = block / sizeof(State128);
+        std::vector<State128> buf(units);
+        for (std::uint64_t at = 0; at < count; at += units) {
+            auto bytes = sizeof(State128) * std::min<std::uint64_t>(units, count - at);
+            if (writing) {
+                BEAM_CUDA_CHECK(cudaMemcpy(buf.data(), states + at, bytes, cudaMemcpyDeviceToHost));
+                file.write(reinterpret_cast<const char*>(buf.data()), bytes);
+            } else {
+                file.read(reinterpret_cast<char*>(buf.data()), bytes);
+                BEAM_CUDA_CHECK(cudaMemcpy(states + at, buf.data(), bytes, cudaMemcpyHostToDevice));
+            }
+        }
+        file.close();
+    }
+    void transfer_history(std::fstream& archive, CpuCandidateHistory::DepthLocation where,
+                          std::uint32_t count, bool writing) {
+        const std::uint64_t n = static_cast<std::uint64_t>(count) * sizeof(HistoryEntry);
+        if (where.location == HistoryStorageLocation::Disk) {
+            auto disk = open_file(history.static_disk_path, writing ? std::ios::in : (std::ios::in | std::ios::out));
+            const auto offset = static_cast<std::streamoff>(where.offset_entries * sizeof(HistoryEntry));
+            if (writing) {
+                disk.seekg(offset);
+                copy_bytes(disk, archive, n);
+            } else {
+                disk.seekp(offset);
+                copy_bytes(archive, disk, n);
+            }
+            disk.close();
+        } else if (where.location == HistoryStorageLocation::Ram) {
+            if (!history.ram_arena || where.offset_entries + count > history.ram_arena_entries)
+                throw std::runtime_error("Invalid checkpoint history location");
+            char* data = reinterpret_cast<char*>(history.ram_arena + where.offset_entries);
+            if (writing) archive.write(data, n);
+            else archive.read(data, n);
+        } else throw std::runtime_error("Checkpoint missing saved history");
+    }
+public:
+    NativeSearchCheckpoint(CpuCandidateHistory& h, State128* s, std::uint64_t cap,
+                           std::uint64_t pid, std::uint64_t b, std::uint32_t l,
+                           bool supported) :
+        history(h), states(s), capacity(cap), puzzle(pid), beam(b), limit(l),
+        root(env_path("CUBE555_SNAPSHOT_DIR", "")), resume(env_path("CUBE555_RESUME_DIR", "")),
+        identity(std::getenv("CUBE555_SNAPSHOT_IDENTITY") ? std::getenv("CUBE555_SNAPSHOT_IDENTITY") : ""),
+        interval(env_u32("CUBE555_SNAPSHOT_SECONDS", 1800)), next(std::chrono::steady_clock::now() + interval) {
+        if (root.empty() && resume.empty()) return;
+        if (!supported || h.mode != CandidateHistoryMode::StaticHybrid || identity.size() != 64 || interval.count() == 0)
+            throw std::runtime_error("Unsupported checkpoint configuration (one-rank static_hybrid collect only)");
+        if (!root.empty()) std::filesystem::create_directories(root);
+    }
+    bool due() const {return !root.empty() && std::chrono::steady_clock::now() >= next;}
+    template<class Export>
+    void save(std::uint32_t depth, std::uint64_t count, Export export_control) {
+        next = std::chrono::steady_clock::now() + interval;
+        const auto name = "next-" + std::to_string(depth);
+        const auto tmp = root / (name + ".partial"), ready = root / (name + ".ready");
+        if (!std::filesystem::create_directory(tmp)) throw std::runtime_error("Snapshot staging directory exists");
+        history.finish_all();
+        if (history.depth_counts.size() != depth) throw std::runtime_error("Depth/history mismatch");
+        auto index = open_file(tmp / "index.txt", std::ios::out);
+        index << "CUBE555-1 " << identity << ' ' << puzzle << ' ' << beam << ' ' << limit << ' ' << depth
+              << ' ' << count << ' ' << sizeof(State128) << ' ' << sizeof(HistoryEntry) << '\n';
+        auto archive = open_file(tmp / "history.bin", std::ios::out);
+        for (std::uint32_t i=0; i<depth; ++i) {
+            const auto entries = history.depth_counts.at(i);
+            if (!history.ram_ready.at(i)) throw std::runtime_error("Uncommitted history");
+            index << entries << '\n';
+            transfer_history(archive, history.depth_locations.at(i), entries, true);
+        }
+        archive.close();
+        transfer_frontier(tmp / "frontier.bin", count, true);
+        export_control(index, tmp);
+        index.close();
+        std::filesystem::rename(tmp, ready);
+        std::cout << "snapshot_ready=" << ready.string() << " next_depth=" << depth << std::endl;
+    }
+    template<class Import>
+    void restore(std::uint32_t& depth, std::uint64_t& count, Import import_control) {
+        if (resume.empty()) return;
+        auto index = open_file(resume / "index.txt", std::ios::in);
+        std::string magic, id;
+        std::uint64_t p, b, l, state_bytes, entry_bytes;
+        index >> magic >> id >> p >> b >> l >> depth >> count >> state_bytes >> entry_bytes;
+        if (magic!="CUBE555-1" || id!=identity || p!=puzzle || b!=beam || l!=limit || !depth || depth>=limit
+            || count>capacity || !count || state_bytes!=sizeof(State128) || entry_bytes!=sizeof(HistoryEntry))
+            throw std::runtime_error("Checkpoint is incompatible with this search");
+        if (std::filesystem::file_size(resume / "frontier.bin") != count * sizeof(State128))
+            throw std::runtime_error("Wrong checkpoint frontier length");
+        auto archive = open_file(resume / "history.bin", std::ios::in);
+        std::uint64_t bytes=0;
+        for (std::uint32_t i=0; i<depth; ++i) {
+            std::uint32_t entries;
+            index >> entries;
+            if (entries>capacity || !entries) throw std::runtime_error("Invalid history count");
+            auto where=history.reserve_static_location(entries);
+            transfer_history(archive, where, entries, false);
+            history.depth_counts.push_back(entries);
+            history.depth_locations.push_back(where);
+            history.depth_files.push_back(where.location==HistoryStorageLocation::Disk ? history.static_disk_path : std::filesystem::path{});
+            history.ram_ready.push_back(true);
+            history.prune_dirty.push_back(false);
+            const std::uint64_t n=static_cast<std::uint64_t>(entries)*sizeof(HistoryEntry);
+            bytes+=n;
+            if (where.location==HistoryStorageLocation::Disk) history.bytes_stored_disk+=n;
+            else history.bytes_stored_ram+=n;
+            history.bytes_received+=static_cast<std::uint64_t>(entries)*sizeof(CandidateMeta);
+        }
+        if (std::filesystem::file_size(resume / "history.bin")!=bytes || history.depth_counts.back()!=count)
+            throw std::runtime_error("Checkpoint history disagrees with frontier");
+        history.bytes_stored=bytes;
+        transfer_frontier(resume / "frontier.bin", count, false);
+        import_control(index, resume);
+        std::cout << "snapshot_restored=1 next_depth=" << depth << " frontier_size=" << count << std::endl;
+    }
+};
+
 struct ReconstructedSolution {
     std::vector<std::uint8_t> moves;
     std::vector<std::uint64_t> parent_indices;
@@ -4956,7 +5103,35 @@ int main(int argc, char** argv) {
     std::set<std::string> solve_bucket_unique_paths;
     bool solve_bucket_found_any = false;
     std::uint32_t solve_bucket_first_found_depth_index = 0;
-    for (std::uint32_t depth = 0; depth < depth_limit; ++depth) {
+    NativeSearchCheckpoint snapshots(history, memory.current_frontier_states, plan.frontier_states,
+        puzzle_id, beam, depth_limit, world_size == 1U && solve_bucket_mode && repair_tasks.size() == 1U);
+    snapshots.restore(completed_depths, frontier_size, [&](std::istream& index, const std::filesystem::path& dir) {
+        index >> total_threshold_updates >> last_final_threshold >> solve_bucket_found_any
+              >> solve_bucket_first_found_depth_index >> task_solution_length >> std::quoted(task_solution_path)
+              >> solve_bucket_record_count;
+        if (solve_bucket_record_count > solve_bucket_max_solutions || solve_bucket_record_count > 100000)
+            throw std::runtime_error("Invalid saved solve-bucket count");
+        for (std::uint64_t i=0; i<solve_bucket_record_count; ++i) {
+            std::string path;
+            index >> std::quoted(path);
+            if (!solve_bucket_unique_paths.insert(path).second) throw std::runtime_error("Duplicate saved path");
+            ++solve_bucket_counts_by_length[parse_solution_path_text(path,host_move_names).size()];
+        }
+        solve_bucket_result.close();
+        std::filesystem::copy_file(dir/"solutions.tsv", solve_bucket_result_path,
+                                   std::filesystem::copy_options::overwrite_existing);
+        solve_bucket_result.open(solve_bucket_result_path, std::ios::out | std::ios::app);
+        if (!solve_bucket_result) throw std::runtime_error("Cannot reopen solve bucket");
+        last_final_frontier_size=frontier_size;
+    });
+    std::unique_ptr<WholeLayer> whole_layer;
+    if (env_u32("CUBE555_SINGLE_GPU_FULL_LAYER", 0) != 0) {
+        if (!solve_bucket_mode || !ring_slot_launcher || world_size != 1U)
+            throw std::runtime_error("Whole-layer search needs a single GPU, collect mode and a model launcher");
+        whole_layer = std::make_unique<WholeLayer>(plan);
+        std::cout << "search_dispatch=single_gpu_whole_layer" << std::endl;
+    }
+    for (std::uint32_t depth = completed_depths; depth < depth_limit; ++depth) {
         const std::uint32_t current_solution_depth = depth + 1U;
         BEAM_CUDA_CHECK(cudaMemcpy(
             memory.current_depth,
@@ -4964,20 +5139,23 @@ int main(int argc, char** argv) {
             sizeof(current_solution_depth),
             cudaMemcpyHostToDevice));
         const auto depth_start = std::chrono::steady_clock::now();
+        const auto layer_started_unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         history.pump_completed(false);
         [[maybe_unused]] const bool emit_depth_log = (depth_log_every != 0U) && ((depth % depth_log_every) == 0U);
 #if BEAM_ENABLE_DEPTH_LOGS
         if (emit_depth_log) {
         std::cout << "depth_start=" << depth
                   << " frontier_size=" << frontier_size
-                  << " depth_limit=" << depth_limit << "\n";
+                  << " depth_limit=" << depth_limit << " started_unix_ms=" << layer_started_unix_ms << std::endl;
         }
 #endif
         GeneratedTrackRequest generated_track_request{};
 #if BEAM_DEBUG_PATH_TRACE
         generated_track_request = tracked_solution.generated_request_for_depth(depth);
 #endif
-        const DepthDispatchState state = run_depth_cuda_graphs(
+        const DepthDispatchState state = whole_layer
+            ? whole_layer->expand(memory, streams.stream1_lanes.at(0), *ring_slot_launcher, frontier_size)
+            : run_depth_cuda_graphs(
             plan,
             memory,
             graphs,
@@ -5269,7 +5447,7 @@ int main(int argc, char** argv) {
                     std::chrono::duration<double>(depth_end - depth_start).count();
 #if BEAM_ENABLE_DEPTH_LOGS
                 if (emit_depth_log) {
-                    std::cout << "depth_done=" << depth << " depth_sec=" << depth_sec << "\n";
+                    std::cout << "depth_done=" << depth << " depth_sec=" << depth_sec << " ended_unix_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << std::endl;
                 }
 #endif
                 if (rank == 0U) {
@@ -5288,7 +5466,7 @@ int main(int argc, char** argv) {
                               << solve_bucket_first_found_depth_index
                               << " extra_depths=" << solve_bucket_extra_depths
                               << " records=" << synchronized_accepted_count
-                              << " depth_sec=" << depth_sec << "\n";
+                              << " depth_sec=" << depth_sec << " ended_unix_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << std::endl;
                 }
                 break;
             }
@@ -5364,6 +5542,7 @@ int main(int argc, char** argv) {
             if (emit_depth_log) {
             std::cout << "depth_global_solved=" << depth
                       << " depth_sec=" << depth_sec
+                  << " ended_unix_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()
                       << " controller_rank=" << distributed_solution.controller
                       << " local_rank=" << rank
                       << " solved_depth=" << distributed_solution.solved_depth
@@ -5423,6 +5602,7 @@ int main(int argc, char** argv) {
             if (emit_depth_log) {
             std::cout << "depth_solved=" << depth
                       << " depth_sec=" << depth_sec
+                  << " ended_unix_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()
                       << " solved_depth=" << solved_depth
                       << " solved_count=" << selected_solved_snapshot.count
                       << " solved_overflow=" << selected_solved_snapshot.overflow
@@ -5445,7 +5625,10 @@ int main(int argc, char** argv) {
         }
 
         CpuCandidateHistory::Slot& history_slot = history.acquire_slot();
-        const FinalizeDepthState final_state = finalize_depth_single_gpu(
+        const FinalizeDepthState final_state = whole_layer
+            ? whole_layer->select(memory, tables, streams.stream1_lanes.at(0),
+                                  history_slot.host, history_slot.capacity, history_slot.copy_done)
+            : finalize_depth_single_gpu(
             plan,
             memory,
             tables,
@@ -5566,6 +5749,7 @@ int main(int argc, char** argv) {
 #endif
         std::cout << "depth_done=" << depth
                   << " depth_sec=" << depth_sec
+                  << " ended_unix_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()
                   << " ring_slot_jobs=" << state.ring_slot_jobs_launched
                   << " stream3_jobs=" << state.stream3_jobs_launched
                   << " stream4_jobs=" << state.stream4_jobs_launched
@@ -5610,6 +5794,25 @@ int main(int argc, char** argv) {
 #endif
         }
 #endif
+        if (frontier_size && completed_depths < depth_limit && snapshots.due()) {
+            try {
+                snapshots.save(completed_depths, frontier_size, [&](std::ostream& index, const std::filesystem::path& dir) {
+                    index << total_threshold_updates << ' ' << last_final_threshold << ' ' << solve_bucket_found_any << ' '
+                          << solve_bucket_first_found_depth_index << ' ' << task_solution_length << ' ' << std::quoted(task_solution_path)
+                          << ' ' << solve_bucket_record_count << '\n';
+                    // The final accepted path may have filled the bucket. That case exits before the checkpoint.
+                    if (solve_bucket_record_count!=solve_bucket_unique_paths.size())
+                        throw std::runtime_error("Inconsistent solve-bucket state");
+                    for (const auto& path: solve_bucket_unique_paths) index << std::quoted(path) << '\n';
+                    solve_bucket_result.flush();
+                    if (!solve_bucket_result) throw std::runtime_error("Cannot flush solutions file");
+                    std::filesystem::copy_file(solve_bucket_result_path, dir/"solutions.tsv");
+                });
+            } catch (const std::exception& error) {
+                std::cerr << "snapshot_write_failed=" << error.what() << std::endl;
+            }
+        }
+
         if (frontier_size == 0) {
             break;
         }

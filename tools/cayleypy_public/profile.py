@@ -79,8 +79,8 @@ def derive_runtime(
     requested_beam = _positive_int(beam_width, "beam_width")
     moves = _positive_int(move_count, "move_count")
     ranks = _positive_int(world_size, "world_size")
-    if ranks != 2:
-        raise ValueError("world_size must be exactly 2 for kaggle_2xt4")
+    if ranks not in (1, 2):
+        raise ValueError("Cube555 Molab supports one or two GPU ranks")
     if profile.get("validation_status") not in {"measured", "bounded_from_measured"}:
         raise ValueError("profile validation_status must be measured or bounded_from_measured")
 

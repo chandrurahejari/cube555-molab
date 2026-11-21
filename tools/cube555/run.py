@@ -2,6 +2,7 @@
 import argparse
 from dataclasses import asdict, replace
 import json
+import os
 from pathlib import Path
 import shutil
 import time
@@ -20,8 +21,8 @@ from tools.run_cayleypy_public import (
 from tools.cube555.export import export_blend
 
 
-MAX_BEAM = 4_000_000
-MAX_DEPTH = 140
+MAX_BEAM = 2**64 - 1
+MAX_DEPTH = int(os.environ.get("CUBE555_MAX_DEPTH", "140"))
 DEFAULT_BEAM = 2_097_152
 BEAM_PROFILES = (65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152, MAX_BEAM)
 
@@ -29,6 +30,11 @@ BEAM_PROFILES = (65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152, MAX_BE
 def history_budgets(available_ram_bytes, tmp_free_bytes):
     # Shared helper already retains 1.5 GB; retain another 4.5 GB for two
     # LibTorch ranks, BFS neighborhoods, Python results and runtime overhead.
+    # Container memory limits can be lower than the host MemAvailable.
+    for max_path, used_path in [(Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+                                (Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"), Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"))]:
+        if max_path.is_file() and used_path.is_file() and max_path.read_text().strip().isdigit():
+            available_ram_bytes = min(available_ram_bytes, int(max_path.read_text()) - int(used_path.read_text()))
     ram, disk = _derive_history_budgets(available_ram_bytes - 4_500_000_000, tmp_free_bytes)
     return min(ram, 24_000_000_000), disk
 
@@ -46,7 +52,9 @@ def runtime_plan(beam: int, profile: str = 'safe', *, b_micro: int = 8192,
     if type(inference_concurrency) is not int or inference_concurrency not in (1, 2, 4):
         raise ValueError('inference_concurrency must be 1, 2 or 4')
     registry = json.loads((Path(__file__).resolve().parents[2] / 'configs/kaggle_t4_transformer_profiles.json').read_text())
-    seed = select_profile(registry, beam, 30, 30)
+    measured_max = registry.get("maximum_validated_beam", {}).get("output_move_count",
+        2 ** max(map(int, registry["profiles"]["output_move_count"])))
+    seed = select_profile(registry, min(beam, measured_max), 30, 30)
     old_batch = seed['runtime']['b_micro']
     seed['runtime']['b_micro'] = b_micro
     # Large Cube4 profiles encode many tiny outer slots. Preserve the candidate
@@ -54,7 +62,14 @@ def runtime_plan(beam: int, profile: str = 'safe', *, b_micro: int = 8192,
     old_slots = seed['runtime']['stream3_ring_slots']
     seed['runtime']['stream3_ring_slots'] = max(2, inference_concurrency, (old_batch * old_slots + b_micro - 1) // b_micro)
     seed['runtime']['stream1_concurrency'] = inference_concurrency
-    plan = derive_runtime(seed, beam, 30, 30, 2)
+    seed.pop('effective_beam', None)  # align the same profile to the active ranks
+    plan = derive_runtime(seed, beam, 30, 30, int(os.environ['CUBE555_WORLD_SIZE']))
+    if plan.effective_beam >= 2**64:
+        raise ValueError('Aligned beam exceeds native uint64 capacity')
+    if plan.shard_capacity_candidates >= 2**32:
+        raise ValueError('Shard capacity exceeds native uint32 capacity')
+    if plan.local_beam >= 2**32:
+        raise ValueError('Per-rank frontier exceeds native uint32 capacity')
     return replace(plan, runtime={**plan.runtime, 'model_micro': micro},
         cross_puzzle_profile_note='Cube4 Transformer pipeline seed; Cube555 capacity requires native preflight and measurement')
 
@@ -76,6 +91,7 @@ def configuration(args, pid, puzzle_info):
         max_collected_solutions=getattr(args, 'max_collected_solutions', 2_000), touch_bfs_radius=args.touch_radius,
         publish_results=getattr(args, 'publish', False),
         results_ingest_url=getattr(args, 'ingest_url', ''), enable_debug=True,
+        debug_path_trace=bool(os.environ.get('CUBE555_TRACE_PATH')),
         **publication,
     ))
 

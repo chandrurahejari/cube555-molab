@@ -1892,6 +1892,10 @@ DepthDispatchState run_depth_cuda_graphs(
     std::vector<std::uint32_t> host_recv_offset(static_cast<std::uint64_t>(plan.config.world_size) + 1ULL);
     std::vector<std::uint64_t> host_parent_base(ring_slot_job_count, 0);
     std::vector<std::uint32_t> host_count(ring_slot_job_count, 0);
+    std::vector<std::uint32_t> host_job_id(ring_slot_job_count);
+    for (std::size_t index = 0; index < host_job_id.size(); ++index) {
+        host_job_id[index] = static_cast<std::uint32_t>(index);
+    }
     std::vector<std::uint32_t> pending_stream4_shards;
     pending_stream4_shards.reserve(plan.storage_shard_count * plan.config.ring_count);
     std::uint32_t pending_stream4_head = 0;
@@ -3087,13 +3091,13 @@ DepthDispatchState run_depth_cuda_graphs(
 #endif
                 check_cuda(cudaMemcpyAsync(
                     memory.streams.parent_base + job,
-                    &parent_base_value,
+                    &host_parent_base[job],
                     sizeof(parent_base_value),
                     cudaMemcpyHostToDevice,
                     lane_stream), "cudaMemcpyAsync parent_base");
                 check_cuda(cudaMemcpyAsync(
                     memory.streams.count + job,
-                    &count_value,
+                    &host_count[job],
                     sizeof(count_value),
                     cudaMemcpyHostToDevice,
                     lane_stream), "cudaMemcpyAsync count");
@@ -3119,7 +3123,7 @@ DepthDispatchState run_depth_cuda_graphs(
                         if (graphs.ring_slot_windowed) {
                             check_cuda(cudaMemcpyAsync(
                                 graphs.ring_slot_job_index + template_job,
-                                &job,
+                                &host_job_id[job],
                                 sizeof(job),
                                 cudaMemcpyHostToDevice,
                                 lane_stream), "cudaMemcpyAsync ring slot graph job index");
