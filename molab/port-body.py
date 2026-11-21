@@ -391,6 +391,10 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         for match in re.finditer(r"depth_done=(\d+) depth_sec=([\d.eE+\-]+)", text):
             records.setdefault(int(match[1]), {})["seconds"] = float(match[2])
         for line in text.splitlines():
+            if line.startswith("whole_layer_depth="):
+                values = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)}
+                if "q_cutoff_key" in values:
+                    records.setdefault(values.pop("whole_layer_depth"), {})["selection"] = values
             event = re.search(r'depth_(start|done)=(\d+)', line)
             stamp = re.search(r'(started|ended)_unix_ms=(\d+)', line)
             if event and stamp:
@@ -412,6 +416,8 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
                                started_utc=min((r['started_utc'] for r in records if r.get('started_utc')), default=None),
                                ended_utc=max((r['ended_utc'] for r in records if r.get('ended_utc')), default=None),
                                saturated=bool(depth >= 7 and effective_beam and frontier == effective_beam)))
+            if len(records) == 1 and "selection" in records[0]:
+                layers[-1]["selection"] = records[0]["selection"]
         return layers
 
     def layer_summary(layers):
@@ -514,10 +520,9 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         with log.open("w", encoding="utf-8") as stream, contextlib.ExitStack() as resources:
             publisher = None
             case_env = env.copy()
-            # On a single GPU, rank and deduplicate the complete layer for beams
-            # up to the measured memory budget; larger/multi-rank jobs keep the
-            # sharded dispatcher. A candidate is never replaced by a CSV move.
-            full_layer = (len(hardware["devices"]) == 1 and beam <= 3_500_000
+            # The Kaggle TPU reference uses 2**22 states. Keep that beam in
+            # the single-device search on the Molab 96 GiB GPU as well.
+            full_layer = (len(hardware["devices"]) == 1 and beam <= 4_194_304
                           and hardware["devices"][0]["bytes"] >= 80 * 1024**3)
             case_env["CUBE555_SINGLE_GPU_FULL_LAYER"] = str(int(full_layer))
             report["search_dispatch"] = "single_gpu_whole_layer" if full_layer else "sharded"
@@ -925,7 +930,7 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         report["symmetry_source"] = frame_tables["source"]
         search_competition = prepare_frame_competition(search_competition, output / "frame-competition",
                                                       symmetry, inverse, frame_tables)
-        # First produce a real solution at the user's original 3.5M setting.
+        # Solve the requested cube at the exact width selected in the form.
         solved = case("solve", puzzle_id, requested_beam, requested_depth)
         if solved.get("solution"):
             report["solution"] = solved["solution"]

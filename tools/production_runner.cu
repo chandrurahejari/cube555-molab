@@ -5103,9 +5103,21 @@ int main(int argc, char** argv) {
     std::set<std::string> solve_bucket_unique_paths;
     bool solve_bucket_found_any = false;
     std::uint32_t solve_bucket_first_found_depth_index = 0;
+    std::unique_ptr<WholeLayer> whole_layer;
+    if (env_u32("CUBE555_SINGLE_GPU_FULL_LAYER", 0) != 0) {
+        if (!solve_bucket_mode || !ring_slot_launcher || world_size != 1U)
+            throw std::runtime_error("Whole-layer search needs a single GPU, collect mode and a model launcher");
+        whole_layer = std::make_unique<WholeLayer>(plan, whole_layer_inverse_moves(host_generators));
+        std::cout << "search_dispatch=single_gpu_whole_layer" << std::endl;
+    }
     NativeSearchCheckpoint snapshots(history, memory.current_frontier_states, plan.frontier_states,
         puzzle_id, beam, depth_limit, world_size == 1U && solve_bucket_mode && repair_tasks.size() == 1U);
     snapshots.restore(completed_depths, frontier_size, [&](std::istream& index, const std::filesystem::path& dir) {
+        // restore() has already loaded and validated the new frontier_size from the snapshot.
+        if (whole_layer)
+            whole_layer->restore_history(dir / "whole-layer.bin", static_cast<std::uint32_t>(frontier_size));
+        else if (std::filesystem::exists(dir / "whole-layer.bin"))
+            throw std::runtime_error("Whole-layer checkpoint requires the whole-layer search");
         index >> total_threshold_updates >> last_final_threshold >> solve_bucket_found_any
               >> solve_bucket_first_found_depth_index >> task_solution_length >> std::quoted(task_solution_path)
               >> solve_bucket_record_count;
@@ -5124,13 +5136,6 @@ int main(int argc, char** argv) {
         if (!solve_bucket_result) throw std::runtime_error("Cannot reopen solve bucket");
         last_final_frontier_size=frontier_size;
     });
-    std::unique_ptr<WholeLayer> whole_layer;
-    if (env_u32("CUBE555_SINGLE_GPU_FULL_LAYER", 0) != 0) {
-        if (!solve_bucket_mode || !ring_slot_launcher || world_size != 1U)
-            throw std::runtime_error("Whole-layer search needs a single GPU, collect mode and a model launcher");
-        whole_layer = std::make_unique<WholeLayer>(plan);
-        std::cout << "search_dispatch=single_gpu_whole_layer" << std::endl;
-    }
     for (std::uint32_t depth = completed_depths; depth < depth_limit; ++depth) {
         const std::uint32_t current_solution_depth = depth + 1U;
         BEAM_CUDA_CHECK(cudaMemcpy(
@@ -5747,6 +5752,16 @@ int main(int argc, char** argv) {
                 static_cast<std::uint64_t>(config.global_spill_capacity);
         const double stream5_ms_total = state.stream5_ms_total + final_state.stream5_threshold_ms;
 #endif
+        if (whole_layer) {
+            std::cout << "whole_layer_depth=" << depth
+                      << " generated=" << final_state.whole_layer_generated
+                      << " unique=" << final_state.whole_layer_unique
+                      << " rejected_history_or_inverse=" << final_state.whole_layer_rejected
+                      << " kept=" << final_state.next_frontier_size
+                      << " q_min_key=" << final_state.whole_layer_min_key
+                      << " q_median_key=" << final_state.whole_layer_median_key
+                      << " q_cutoff_key=" << final_state.final_threshold << "\n";
+        }
         std::cout << "depth_done=" << depth
                   << " depth_sec=" << depth_sec
                   << " ended_unix_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()
@@ -5797,6 +5812,8 @@ int main(int argc, char** argv) {
         if (frontier_size && completed_depths < depth_limit && snapshots.due()) {
             try {
                 snapshots.save(completed_depths, frontier_size, [&](std::ostream& index, const std::filesystem::path& dir) {
+                    if (whole_layer)
+                        whole_layer->save_history(dir / "whole-layer.bin", static_cast<std::uint32_t>(frontier_size));
                     index << total_threshold_updates << ' ' << last_final_threshold << ' ' << solve_bucket_found_any << ' '
                           << solve_bucket_first_found_depth_index << ' ' << task_solution_length << ' ' << std::quoted(task_solution_path)
                           << ' ' << solve_bucket_record_count << '\n';

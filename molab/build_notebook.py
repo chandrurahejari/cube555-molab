@@ -168,7 +168,7 @@ def generate_notebook(destination, puzzle_id, beam_width, max_depth=300, *, queu
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cube", type=int)
-    parser.add_argument("--beam", type=int, default=3_500_000)
+    parser.add_argument("--beam", type=int, default=4_194_304)
     parser.add_argument("--depth", type=int)
     parser.add_argument("--symmetry", type=int, choices=range(48), default=0)
     parser.add_argument("--inverse", action="store_true")

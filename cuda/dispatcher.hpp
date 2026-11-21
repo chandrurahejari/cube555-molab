@@ -272,6 +272,11 @@ struct DepthDispatchState {
 
 struct FinalizeDepthState {
     std::uint64_t next_frontier_size = 0;
+    std::uint32_t whole_layer_generated = 0;
+    std::uint32_t whole_layer_unique = 0;
+    std::uint32_t whole_layer_rejected = 0;
+    std::uint32_t whole_layer_min_key = 0;
+    std::uint32_t whole_layer_median_key = 0;
     std::uint32_t final_threshold = 0;
     std::uint32_t final_candidate_count = 0;
     std::uint32_t final_request_count = 0;
