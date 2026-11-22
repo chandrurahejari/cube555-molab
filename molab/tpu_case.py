@@ -44,8 +44,8 @@ def prepare_jax_gpu():
     return python
 
 
-def tpu_case(kind, pid, beam, depth):
-    folder = output / f"tpu-{kind}-{pid}-{beam}"
+def tpu_case(kind, pid, beam, depth, small_batches=False):
+    folder = output / (f"tpu-{kind}-{pid}-{beam}" + ("-smaller-batches" if small_batches else ""))
     folder.mkdir()
     log = folder / "worker.log"
     events = folder / "events.jsonl"
@@ -108,6 +108,8 @@ def tpu_case(kind, pid, beam, depth):
 
     args = [python, repo / "tools/tpu_solve.py", "--competition", search_competition, "--assets", inputs / "model",
             "--output", folder, "--pid", pid, "--beam", beam, "--depth", depth, "--device", "gpu"]
+    if small_batches:
+        args.extend(["--model-micro", "128", "--parent-chunk", "16384"])
     if (pid, symmetry, inverse, beam, depth) == (46, 0, False, 8192, 32):
         args.extend(["--layer-audit", "--model-micro", "128"])
     save(f"{kind} PID {pid} / beam {beam}")
@@ -144,6 +146,17 @@ def tpu_case(kind, pid, beam, depth):
     if child.returncode or result.get("status") not in ("solved", "not_found"):
         row.update(status="failed", error=result.get("error") or f"JAX exited with code {child.returncode}",
                    diagnostic=report["last_log"])
+        detail = (row["error"] + "\n" + row["diagnostic"]).lower()
+        gpu_allocation_failed = ("cuda_error_out_of_memory" in detail or "cudaerrormemoryallocation" in detail
+                                 or ("resource_exhausted" in detail and ("allocat" in detail or "out of memory" in detail)))
+        if (not small_batches and beam >= 1_000_000 and row["completed_layers"] <= 5
+                and gpu_allocation_failed and time.monotonic() - started < 1800):
+            report.setdefault("jax_memory_retries", []).append(dict(
+                puzzle_id=pid, requested_beam=beam, requested_depth=depth, completed_layers=row["completed_layers"],
+                original_error=row["error"], original_log=row["diagnostic"], elapsed_seconds=row["wall_seconds"],
+                retry_model_micro=128, retry_parent_chunk=16384))
+            save("retrying_jax_gpu_allocation")
+            return tpu_case(kind, pid, beam, depth, small_batches=True)
     else:
         if (result["pid"], result["beam"], result["depth"], result["layers_completed"]) != (pid, beam, depth, row["completed_layers"]):
             raise ValueError("JAX worker identity or layer count mismatch")

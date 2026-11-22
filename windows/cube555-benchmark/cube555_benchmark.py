@@ -41,7 +41,7 @@ RETRYABLE = {'cloud_unavailable', 'gpu_unavailable', 'not_started', 'import_abse
              'imported_no_session', 'cloud_absent_without_terminal_report', 'no_first_drive_write'}
 MOSCOW = timezone(timedelta(hours=3))
 END_STATUSES = {'complete', 'partial', 'failed', 'gpu_unavailable', 'stopped'}
-PLANNED_MODES = {'diagnostics', 'repair', 'tpu_controls', 'tpu_parity_four'}
+PLANNED_MODES = {'diagnostics', 'repair', 'tpu_controls', 'tpu_parity_four', 'long18'}
 
 
 def atomic_json(path, value):
@@ -89,11 +89,13 @@ def night_deadline(now):
     return min(now + 10 * 3600, noon.timestamp())
 
 
-def historical_layer_rate(directory):
+def historical_layer_rate(directory, jax_width=None):
     """Median of per-job medians, in seconds per 1M actual retained states."""
     medians = []
     for path in directory.glob('*/job.json'):
         job = read_json(path, {})
+        if jax_width and (job.get('backend') != 'kaggle_jax_logical_ranks_cuda' or job.get('beam') != jax_width):
+            continue
         layers = job.get('depth_timings') or (job.get('current_case') or {}).get('depth_timings') or []
         rates = [r['seconds'] * 1e6 / r['frontier_size'] for r in layers if r.get('saturated') and
                  r.get('depth',0) >= 7 and r.get('frontier_size',0) > 0 and r.get('seconds',0) > 0]
@@ -164,6 +166,46 @@ def read_competition(path):
         with archive.open('test.csv') as file, io.TextIOWrapper(file, encoding='utf-8-sig') as text:
             states = {int(r['initial_state_id']): tuple(map(int, r['initial_state'].split(','))) for r in csv.DictReader(text)}
     return states, rules['generators'], tuple(rules['central_state'])
+
+
+def terminal_single_job(state):
+    jobs = state.get('jobs', [])
+    if (state.get('mode') == 'single' and state.get('status') == 'running' and len(jobs) == 1
+        and jobs[0].get('state') == 'releasing' and (state.get('pending') or {}).get('action') in (None, 'shutdown')):
+        job = jobs[0].get('job') or {}
+        if job.get('status') in END_STATUSES and job.get('id') and job.get('key'):
+            return job
+    return None
+
+
+def long18_plan(lengths, seed):
+    """Interleave distinct length groups; keep each cube and frame reproducible."""
+    rng = random.Random(seed)
+    groups = {}
+    for pid, length in sorted(lengths.items()):
+        if length > 104:
+            groups.setdefault(length, []).append(pid)
+    if not groups:
+        raise ValueError('В CSV нет кубиков с длиной больше 104.')
+    for ids in groups.values():
+        rng.shuffle(ids)
+    # Start with an easier long cube, then sample the long tail within the first night.
+    bands = sorted(groups)
+    order = []
+    while bands:
+        order.append(bands.pop(0))
+        if bands:
+            order.append(bands.pop())
+    cases = []
+    while any(groups.values()):
+        for length in order:
+            if groups[length]:
+                pid = groups[length].pop()
+                cases.append(dict(cube=pid, beam=4_194_304, requested_depth=length+20,
+                                  symmetry=rng.randrange(48), inverse=bool(rng.getrandbits(1)),
+                                  case_number=len(cases)+1, lane='long18',
+                                  purpose=f'Длинный кубик: эталон {length}, предел {length+20} слоёв'))
+    return cases
 
 
 def update_best_path(best, job, competition):
@@ -460,9 +502,12 @@ class Controller:
             self.persist()
 
     def start(self, symmetry=3, hours=24, single=None, diagnostics=False, seed=None,
-              baseline=CURRENT_CSV, repair=None, tpu_controls=False, tpu_parity_four=False):
+              baseline=CURRENT_CSV, repair=None, tpu_controls=False, tpu_parity_four=False, long18=False):
         self.reconcile_local_launches()
-        if self.state.get('status') in {'running', 'paused', 'stopping','resuming'}:
+        previous = terminal_single_job(self.state) if long18 else None
+        previous_directory = self.directory if previous else None
+        previous_pending = dict(self.state.get('pending') or {}) if previous else None
+        if not previous and self.state.get('status') in {'running', 'paused', 'stopping','resuming'}:
             raise ValueError('Текущая серия ещё активна.')
         if type(symmetry) is not int or not 0 <= symmetry < 48:
             raise ValueError('Симметрия должна быть целым числом 0–47.')
@@ -477,7 +522,7 @@ class Controller:
         if not self.first.is_file():
             raise FileNotFoundError(f'Не найдена первая форма: {self.first}')
         plan = None
-        is_tpu = tpu_controls or tpu_parity_four
+        is_tpu = tpu_controls or tpu_parity_four or long18
         if diagnostics or repair or is_tpu:
             if repair:
                 state_file = Path(repair).resolve()
@@ -489,14 +534,16 @@ class Controller:
                 source = state_file.parent / 'baseline.csv'
                 seed = previous['seed']
             else:
-                hours = 10
+                hours = 18 if long18 else 10
                 seed = random.SystemRandom().getrandbits(32) if seed is None else int(seed)
                 source = Path(baseline)
             baseline_data = source.read_bytes()
             self.lengths = load_lengths(source)
             if repair and hashlib.sha256(baseline_data).hexdigest() != previous['baseline_sha256']:
                 raise ValueError('Контрольная сумма baseline.csv отличается от исходного эксперимента.')
-            if is_tpu:
+            if long18:
+                plan = long18_plan(self.lengths, seed)
+            elif is_tpu:
                 plan = tpu_control_plan(self.lengths, parity_four=tpu_parity_four)
             else:
                 plan = repair_plan(previous, self.lengths) if repair else diagnostic_plan(self.lengths, seed)
@@ -504,14 +551,14 @@ class Controller:
         deadline = night_deadline(now) if diagnostics else now + hours * 3600
         self.directory = self.data / (time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:6])
         self.directory.mkdir(parents=True)
-        mode = 'tpu_parity_four' if tpu_parity_four else 'tpu_controls' if tpu_controls else 'repair' if repair else 'diagnostics' if diagnostics else 'single' if single else 'benchmark'
+        mode = 'long18' if long18 else 'tpu_parity_four' if tpu_parity_four else 'tpu_controls' if tpu_controls else 'repair' if repair else 'diagnostics' if diagnostics else 'single' if single else 'benchmark'
         self.state = dict(version=4, layer_count_version=1, mode=mode, single=single,
             status='running', started=now, deadline=deadline,
             symmetry=int(symmetry), poll_seconds=POLL_SECONDS, jobs=[], pending=None,
             listing=None, listed_at=0, next_list=0, message='Проверка работающих ноутбуков через форму 1',
             baseline_lengths={str(k): self.lengths.get(k) for k in (57, 67, 94, 124, 145)})
         if diagnostics or repair or is_tpu:
-            rate = historical_layer_rate(self.first.parent / 'runs')
+            rate = historical_layer_rate(self.first.parent / 'runs', 4_194_304 if long18 else None)
             # Both directions run in the same slot, one after the other.
             budget = deadline - now - CLEANUP_MARGIN
             planned = []
@@ -522,7 +569,10 @@ class Controller:
                 planned.extend([dict(a, estimated_seconds=estimated),dict(b, estimated_seconds=estimated)])
                 budget -= 2 * estimated
             if is_tpu:
-                self.state['depth_margin'] = 20 if tpu_parity_four else 10
+                self.state['depth_margin'] = 20 if tpu_parity_four or long18 else 10
+                if long18:
+                    template = self.first.parent / 'cube555_template.py'
+                    self.state['template_sha256'] = hashlib.sha256(template.read_bytes()).hexdigest()
                 if tpu_parity_four:
                     self.state['quality_tolerance'] = 4
                     template = self.first.parent / 'cube555_template.py'
@@ -553,6 +603,13 @@ class Controller:
                               estimated_seconds_per_million=rate, reference='comparison-only; native tracing only for cube 68',
                               baseline_sha256=hashlib.sha256(baseline_data).hexdigest(),
                               baseline_lengths={str(k): self.lengths[k] for k in {c['cube'] for c in plan}})
+        if previous:
+            self.state['predecessor'] = dict(directory=str(previous_directory), key=previous['key'], id=previous['id'])
+            self.state['message'] = 'Серия началась. Перед первым тестом форма 1 освобождает сессию предыдущего завершённого теста.'
+            if previous_pending:
+                previous_pending.update(test_id=None, target_id=previous['key'])
+                self.state['pending'] = previous_pending
+        self.persist()
         atomic_json(self.pointer, {'directory': str(self.directory)})
         self.event('started', hours=hours, symmetry=symmetry, mode=self.state['mode'], single=single)
         self.persist()
@@ -726,6 +783,22 @@ class Controller:
                 result = receipt.get('job') or {}
                 good = result.get('key') == key and not result.get('communication_error') and not receipt.get('error')
                 self.state.setdefault('external_reads', {})[key] = {'time':now,'ok':good}
+            elif self.state.get('predecessor', {}).get('key') == pending['target_id']:
+                previous = self.state['predecessor']
+                job = receipt.get('job') or {}
+                if job.get('id') == previous['id'] and job.get('session_released') and not receipt.get('error'):
+                    path = Path(previous['directory']) / 'state.json'
+                    archived = read_json(path, {})
+                    terminal = terminal_single_job(archived)
+                    if terminal and terminal['id'] == job['id']:
+                        archived['jobs'][0].update(job=job, released=True, state='finished', finished=now)
+                        archived.update(pending=None, status='finished', finished=now, message='Расчёт и освобождение сессии подтверждены.')
+                        atomic_json(path, archived)
+                    self.state.pop('predecessor')
+                    self.event('predecessor_released', key=job['key'])
+                else:
+                    previous['retry_at'] = now + LIST_RETRY_SECONDS
+                    self.state['message'] = 'Форма 1 повторит освобождение предыдущей сессии через минуту.'
             elif cleanup:
                 target = pending['target_id']
                 result = receipt.get('job') or {}
@@ -757,6 +830,10 @@ class Controller:
             if action != 'shutdown':
                 test['classification'] = classify(job, report)
             solution = verified_path(test)
+            if self.state['mode'] == 'long18':
+                selected = (report.get('best_verified_paths') or {}).get(str(test['cube']))
+                if selected and selected.get('verified'):
+                    test['best_verified_path'] = selected
             if self.competition and update_best_path(self.best_paths, job, self.competition):
                 atomic_json(self.best_path_file, self.best_paths)
             if self.state['mode'] == 'tpu_parity_four' and self.competition and solution:
@@ -829,7 +906,7 @@ class Controller:
     def wait_for_external_drive(self, now):
         # Molab's visible list can omit another browser profile's running notebook.
         # Cross-check independently launched Form 1 notebooks before allocating a GPU.
-        if self.state.get('mode') != 'tpu_parity_four':
+        if self.state.get('mode') not in {'tpu_parity_four', 'long18'}:
             return False
         if now < self.state.get('external_scan_at', 0):
             return bool(self.state.get('external_blocker'))
@@ -921,7 +998,7 @@ class Controller:
                     self.state['plan'].append(extra)
                     return dict(extra,attempt=1)
             return None
-        if self.state.get('mode') in {'diagnostics', 'tpu_controls', 'tpu_parity_four'}:
+        if self.state.get('mode') in {'diagnostics', 'tpu_controls', 'tpu_parity_four', 'long18'}:
             scheduled = set(self.state.get('prior_attempts', [])) | {t['case_number'] for t in tests}
             successes = self.parity_successes() if self.state['mode'] == 'tpu_parity_four' else set()
             remaining = self.state['deadline'] - self.clock() - CLEANUP_MARGIN
@@ -937,6 +1014,10 @@ class Controller:
                     estimate = math.ceil(600 + measured * (case['requested_depth'] - 3))
                 if estimate <= cap:
                     return dict(case, estimated_seconds=estimate)
+                if self.state['mode'] == 'long18' and cap == SESSION_LIMIT-CLEANUP_MARGIN:
+                    # A new solver revision can have a slower layer. Still measure a
+                    # full affordable session. The independent session timer stops it.
+                    return dict(case, estimated_seconds=estimate, session_budget_seconds=cap)
             return None
         if self.state.get('mode') == 'single':
             config = self.state['single']
@@ -1085,6 +1166,11 @@ class Controller:
             self.persist()
         if self.consume():
             return
+        previous = self.state.get('predecessor')
+        if previous and self.state['status'] == 'running':
+            if now >= previous.get('retry_at', 0):
+                self.request('shutdown', target_id=previous['key'])
+            return
         if self.state.get('status') == 'resuming':
             self.continue_cleanup()
             return
@@ -1154,7 +1240,7 @@ class Controller:
             return
         candidate = self.plan_next()
         if not candidate:
-            if self.state.get('mode') == 'tpu_controls' and not active:
+            if self.state.get('mode') in {'tpu_controls', 'long18'} and not active:
                 self.state['message'] = 'До завершения серии недостаточно времени для ещё одного полного расчёта.'
                 self.refresh_snapshot()
                 return
@@ -1356,6 +1442,7 @@ def main():
     action.add_argument('--resume', action='store_true', help='Продолжить текущую серию после освобождения сессий')
     action.add_argument('--stop', action='store_true', help='Завершить серию и освободить её сессию до нового теста')
     parser.add_argument('--inverse', action='store_true', help='Обратный поиск для одиночного теста')
+    action.add_argument('--long18', action='store_true', help='18 часов, пути длиннее 104, глубина эталон +20')
     parser.add_argument('--cuda-diagnostics', choices=('off','sync','memcheck'), default='off')
     parser.add_argument('--seed', type=int, help='Начальное число для повторения порядка симметрий')
     parser.add_argument('--baseline', type=Path, default=CURRENT_CSV, help='Текущий CSV с путями для ночной проверки')
@@ -1375,12 +1462,12 @@ def main():
             raise ValueError()
     except ValueError:
         parser.error('--request-id должен быть UUID из 32 шестнадцатеричных символов')
-    requested = args.start or args.test or args.diagnostics or args.tpu_controls or args.tpu_parity_four or args.repair or args.resume or args.stop
+    requested = args.start or args.test or args.diagnostics or args.tpu_controls or args.tpu_parity_four or args.long18 or args.repair or args.resume or args.stop
     if requested:
         if (requests / (request_id + '.receipt')).exists():
             return
         atomic_json(requests / (request_id + '.json'), dict(start=args.start, test=args.test,
-            diagnostics=args.diagnostics, tpu_controls=args.tpu_controls, tpu_parity_four=args.tpu_parity_four,
+            diagnostics=args.diagnostics, tpu_controls=args.tpu_controls, tpu_parity_four=args.tpu_parity_four, long18=args.long18,
             seed=args.seed, baseline=str(args.baseline),
             repair=str(args.repair.resolve()) if args.repair else None, resume=args.resume, stop=args.stop,
             inverse=args.inverse, cuda_diagnostics=args.cuda_diagnostics,
@@ -1421,6 +1508,7 @@ def main():
                             command=lambda: controller.commands.put(('start',dict(tpu_options))))
     tpu_button.pack(side='left', padx=(0,8))
     parity_options = dict(tpu_parity_four=True, baseline=str(args.baseline))
+    long_options = dict(long18=True, baseline=str(args.baseline))
     ttk.Label(controls, text='Симметрия (0–47)').pack(side='left')
     symmetry = tk.StringVar(value=str(args.symmetry))
     choose = ttk.Combobox(controls, textvariable=symmetry, values=list(range(48)), width=5, state='readonly')
@@ -1464,6 +1552,9 @@ def main():
     repair_source = tk.StringVar()
     repair_button = ttk.Button(single_controls, text='Повторить неудачные', command=repair_run)
     repair_button.pack(side='left', padx=8)
+    long_button = ttk.Button(single_controls, text='18 часов · длина > 104',
+                            command=lambda: controller.commands.put(('start', dict(long_options))))
+    long_button.pack(side='left', padx=4)
     parity_button = ttk.Button(single_controls, text='4 кубика · путь до +4',
                                command=lambda: controller.commands.put(('start',dict(parity_options))))
     parity_button.pack(side='left', padx=(0, 4))
@@ -1516,6 +1607,8 @@ def main():
             next_action.set(next_step)
             end = snapshot.get('finished', now)
             mode = {'single':'Одиночный тест', 'tpu_controls':'40 / 100 / 110 · 10 часов', 'tpu_parity_four':'4 кубика · глубина +20, путь до +4', 'repair':'Повтор неудачных тестов', 'diagnostics':'Ночная проверка до ' + datetime.fromtimestamp(snapshot['deadline'],MOSCOW).strftime('%H:%M МСК')}.get(snapshot.get('mode'),'Испытание на 24 часа')
+            if snapshot.get('mode') == 'long18':
+                mode = '18 часов · длина > 104 · запас 20'
             clock_text.set(f"{mode} · прошло {duration(end - snapshot['started'])} · осталось {duration(snapshot['deadline'] - now)}")
         jobs = snapshot.get('jobs', [])
         ids = {t['test_id'] for t in jobs}
@@ -1585,7 +1678,12 @@ def main():
                         request_path.unlink(missing_ok=True)
                         root.after(1000, render)
                         return
-                    if active:
+                    if active and command.get('long18') and snapshot.get('mode') == 'single' and not terminal_single_job(snapshot):
+                        # An outstanding desktop unlock/shutdown must finish first. Keep
+                        # the durable request pending. The next supervisor tick retries it.
+                        root.after(1000, render)
+                        return
+                    if active and not (command.get('long18') and terminal_single_job(snapshot)):
                         raise ValueError('Сначала завершите текущее испытание; новый запуск не создан.')
                     symmetry.set(str(int(command['symmetry'])))
                     if command.get('repair'):
@@ -1593,6 +1691,12 @@ def main():
                         repair_button.invoke()
                         repair_source.set('')
                         handler = 'repair_button'
+                    elif command.get('long18'):
+                        source = Path(command['baseline'])
+                        load_lengths(source)
+                        long_options.update(baseline=str(source), seed=command.get('seed'))
+                        long_button.invoke()
+                        handler = 'long18_button'
                     elif command.get('tpu_parity_four'):
                         source = Path(command['baseline'])
                         tpu_control_plan(load_lengths(source), parity_four=True)

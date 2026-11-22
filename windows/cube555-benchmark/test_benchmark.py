@@ -264,6 +264,29 @@ class BenchmarkTests(unittest.TestCase):
         self.controller.state['prior_attempts'] = list(range(1,17))
         self.assertIsNone(self.controller.plan_next())
 
+    def test_long18_exact_cutoff_depth_and_inherited_shutdown(self):
+        lengths = {12:104, 13:105, 14:107, 15:112}
+        source = self.directory / 'long.csv'
+        source.write_text('initial_state_id,path\n' + ''.join(
+            f"{pid},{'.'.join(['r0']*lengths.get(pid,1))}\n" for pid in range(1035)))
+        (self.exe.parent/'cube555_template.py').write_text('fixed')
+        c = self.controller
+        old = c.directory
+        c.state.update(mode='single', status='running',
+                       jobs=[{'test_id':'one', 'state':'releasing', 'job':{'key':'old','id':'nb_old','status':'complete'}}])
+        c.persist()
+        c.start(long18=True, baseline=source, seed=10)
+        self.assertEqual(c.state['deadline']-c.state['started'], 18*3600)
+        self.assertEqual({x['cube']:x['requested_depth'] for x in c.state['plan']}, {13:125,14:127,15:132})
+        self.assertEqual({x['beam'] for x in c.state['plan']}, {4194304})
+        self.assertEqual(c.state['jobs'], [])
+        c.tick()
+        self.assertEqual(c.state['pending']['action'], 'shutdown')
+        self.assertEqual(c.state['pending']['target_id'], 'old')
+        self.receipt({'job':{'id':'nb_old','key':'old','session_released':True}})
+        self.assertNotIn('predecessor', c.state)
+        self.assertEqual(module.read_json(old/'state.json',{})['status'], 'finished')
+
     def test_empty_inventory_cannot_override_live_external_drive(self):
         c = self.controller
         c.state.update(mode='tpu_parity_four', listing={'running':[]}, listed_at=self.now)
