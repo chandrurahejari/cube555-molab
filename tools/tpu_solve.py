@@ -127,12 +127,19 @@ def solve(args, emit):
             emit(dict(event="layer_audit", **receipt))
             previous, packet = pack_layer(args.output / f"layer-{layer:04}.npz", previous, moves)
             emit(dict(event="snapshot", layer=layer, **packet))
-        engine = load_observed_engine(ROOT / "tools/tpu_reference/jax_beam_spmd_v_only.py",
-                                      "tools.tpu_reference.observed_beam", observe)
+        reference = args.original_cpu
+        if reference:
+            verify(reference / "jax_beam_spmd_v_only.py", "cb62b5e8319b44907114ca1feb06147024afd6c0e4bbc3af5c5fff84501f51f8")
+            verify(reference / "jax_model.py", "93955759e1c36031ab983a41249d10406d77eae52b9daee058421a2cde0e86d6")
+            sys.path.insert(0, str(reference.resolve()))
+        engine = load_observed_engine((reference or (ROOT / "tools/tpu_reference")) / "jax_beam_spmd_v_only.py",
+                                      "observed_reference" if reference else "tools.tpu_reference.observed_beam", observe)
         beam_solve_v_only_spmd_packed = engine.beam_solve_v_only_spmd_packed
 
     device = jax.devices(args.device)[0]
-    mesh = make_mesh([device])
+    mesh = make_mesh(jax.devices("cpu") if args.physical_cpu else [device])
+    if args.physical_cpu and mesh.size != 8:
+        raise ValueError("The original distributed CPU reference requires exactly eight XLA devices")
     emit(dict(event="probe", stage="device_ready", platform=device.platform, device_kind=device.device_kind))
     for name in ("q555_f1_bell2k.pt", "q555_2k_BEST.pt", "piece_layout_555.json"):
         verify(args.assets / name, PINNED[name])
@@ -148,21 +155,23 @@ def solve(args, emit):
     if root_q.shape != (1, 30) or not np.isfinite(root_q).all():
         raise ValueError("Invalid Q scores for the initial cube.")
     local = args.beam // 8
-    chunk = divisor(local, args.parent_chunk)
-    micro = divisor(chunk, args.model_micro)
+    chunk_size = args.parent_chunk if args.parent_chunk is not None else (0 if args.beam <= 4_194_304 else 131072)
+    chunk = None if args.original_cpu or chunk_size == 0 else divisor(local, chunk_size)
+    micro = divisor(chunk or local, args.model_micro)
     inverse = np.asarray([names.index(n[1:] if n.startswith("-") else "-"+n) for n in names], dtype=np.int32)
     emit(dict(event="probe", stage="model_ready", root_q=root_q[0].tolist(), endgame_count=len(hashes),
               endgame_sha256=PINNED["bfs_endgame.npz"], logical_ranks=8, local_beam=local,
               parent_chunk=chunk, model_micro=micro, k_per_peer=2*local//8))
     hash_vector = np.random.default_rng(0).integers(0, 10**15, 150, dtype=np.int64)
     owner_vector = np.random.default_rng(12345).integers(0, 2**32-1, 150, dtype=np.uint32)
+    placement = {} if args.original_cpu else dict(logical_ranks=None if args.physical_cpu else 8, on_layer=emit)
     result = beam_solve_v_only_spmd_packed(
         start.tolist(), blend, jnp.asarray(moves), jnp.asarray(goal), jnp.asarray(hash_vector), mesh,
         B_local=local, K_per_peer=2*local//8, n_gen=30, state_size=150, num_steps=args.depth,
         dtype=jnp.bfloat16, internal_bs=micro, tree_path=str(args.output / "tree.u32"),
         parent_chunk=chunk, owner_hash_vec=jnp.asarray(owner_vector), history_depth=4, history_exact=True,
         eg_hashes=jnp.asarray(hashes), eg_ztab=jnp.asarray(ztab), inv_move_tbl=jnp.asarray(inverse),
-        pack_v_score=True, q_mode=True, qv_consistency=0.0, logical_ranks=8, on_layer=emit)
+        pack_v_score=True, q_mode=True, qv_consistency=0.0, **placement)
     common = dict(compile_seconds=result.get("compile_s"), search_seconds=result.get("wall_s"))
     if not result["found"]:
         return dict(status="not_found", reason="depth_exhausted", **common)
@@ -193,11 +202,21 @@ def main():
     for flag in ("pid", "beam", "depth"):
         parser.add_argument("--"+flag, type=int, required=True)
     parser.add_argument("--device", choices=("cpu", "gpu"), required=True)
-    parser.add_argument("--model-micro", type=int, default=128)
-    parser.add_argument("--parent-chunk", type=int, default=16384)
+    parser.add_argument("--model-micro", type=int, default=4096)
+    parser.add_argument("--parent-chunk", type=int, help="Default matches Kaggle: whole rank through 4,194,304, then chunks of 131,072 parents.")
     parser.add_argument("--layer-audit", action="store_true", help="Record selected states, scores and parents for paired TPU/GPU comparisons.")
+    parser.add_argument("--original-cpu", type=Path, help="Emulate the unmodified, checksum-pinned Kaggle solver from this artifact directory on eight XLA CPU devices.")
+    parser.add_argument("--physical-cpu", action="store_true", help="Exercise the patched physical shard_map on eight local XLA CPU devices.")
     args = parser.parse_args()
-    if args.beam < 32 or args.beam % 8 or min(args.depth, args.model_micro, args.parent_chunk) <= 0:
+    if args.original_cpu:
+        if not args.layer_audit:
+            parser.error("--original-cpu requires --device cpu --layer-audit")
+        args.physical_cpu = True
+    if args.physical_cpu:
+        if args.device != "cpu":
+            parser.error("The CPU placement test requires --device cpu")
+        os.environ["JAX_NUM_CPU_DEVICES"] = "8"
+    if args.beam < 32 or args.beam % 8 or min(args.depth, args.model_micro) <= 0 or (args.parent_chunk or 0) < 0:
         parser.error("Use a beam divisible by eight (at least 32), and positive depth and batch sizes.")
     os.environ["JAX_PLATFORMS"] = "cpu" if args.device == "cpu" else "cuda"
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -212,6 +231,8 @@ def main():
             row = dict(pid=args.pid, beam=args.beam, unix=time.time(), **event)
             log.write(json.dumps(row, allow_nan=False)+"\n")
             if row["event"] == "layer_end":
+                result["layers_completed"] = max(result["layers_completed"], int(row["layer"]))
+            elif args.original_cpu and row["event"] == "layer_audit":
                 result["layers_completed"] = max(result["layers_completed"], int(row["layer"]))
         try:
             emit(dict(event="probe", stage="worker_started"))

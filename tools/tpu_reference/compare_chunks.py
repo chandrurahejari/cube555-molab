@@ -72,6 +72,8 @@ def main():
                 real = frontier[np.any(frontier,axis=1)]
                 children = real[:,moves].reshape(-1,150)
                 n_unique = len(np.unique(real,axis=0))
+                if n_unique != len(real):
+                    raise AssertionError(f"Masked duplicate states re-entered layer {layer}: {len(real)-n_unique}")
                 child_states = np.unique(children,axis=0)
                 child_h = child_states.astype(np.int64) @ h
                 if len(np.unique(child_h)) != len(child_states):

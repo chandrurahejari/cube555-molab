@@ -74,7 +74,7 @@ Algorithm (per step inside the shard_map body):
      uint8 records.
   5. Single packed `lax.all_to_all` routes bucket S from each sender to rank S.
   6. Receiver: in-rank dedup (sort+adjacent-equal+restore), RE-RUN V on
-     received states (cheap vs. step 2 — aB_LOCAL ≈ 2*B_LOCAL vs. 24*B_LOCAL),
+     received states (cheap vs. step 2 РІР‚вЂќ aB_LOCAL РІвЂ°в‚¬ 2*B_LOCAL vs. 24*B_LOCAL),
      topk(B_LOCAL) by V.
   7. V0 detection: hash equality + non-padding filter (per-rank).
 
@@ -84,7 +84,7 @@ its own local first-hit state; wrapper picks the global winner on host
 after the loop.
 
 Re-running V on receive instead of packing V scores into the bucket keeps
-PACK_SIZE=96 and the packing identical to jax_beam_spmd.py — simpler code,
+PACK_SIZE=96 and the packing identical to jax_beam_spmd.py РІР‚вЂќ simpler code,
 lower bug surface. The ~8% extra compute (aB_LOCAL vs. 24*B_LOCAL) is
 negligible.
 """
@@ -230,7 +230,7 @@ def _build_step_body_v_only(
         # 1. Generate all children of owned states.
         neighbors = states[:, all_moves].reshape(-1, state_size)  # (n_total, S)
 
-        # 2. V on ALL children (the V-only step — no qshort prefilter).
+        # 2. V on ALL children (the V-only step РІР‚вЂќ no qshort prefilter).
         child_v = forward_v(v_params, neighbors)  # (n_total,) float32
 
         # 3. Hash + owner per child.
@@ -301,8 +301,8 @@ def _build_step_body_v_only(
         dup_mask = is_dup_sorted[restore]
 
         # 7. Re-run V on received states (necessary because we didn't pack V
-        # scores into the bucket — keeps PACK_SIZE=96, same layout as the qshort body).
-        # aB_local ≈ 2 * B_local is small vs. n_total = 24 * B_local so the
+        # scores into the bucket РІР‚вЂќ keeps PACK_SIZE=96, same layout as the qshort body).
+        # aB_local РІвЂ°в‚¬ 2 * B_local is small vs. n_total = 24 * B_local so the
         # extra compute is ~8%.
         recv_v = forward_v(v_params, recv_states)
         recv_v_masked = jnp.where(dup_mask | is_padding, BIG_F32, recv_v)
@@ -527,6 +527,16 @@ def beam_solve_v_only_spmd(
 # Phase A+B variant: packed uint32 backpointers, host memmap tree, early stop.
 # =============================================================================
 
+def _rank_forward(apply, params, states, dtype):
+    # Preserve the per-rank model batch geometry of one TPU core when the eight
+    # rank bodies are placed on a single accelerator. Exchange remains vectorized.
+    from jax.custom_batching import sequential_vmap
+    @sequential_vmap
+    def evaluate(batch):
+        return apply(params, batch, dtype=dtype)
+    return evaluate(states)
+
+
 def _build_step_body_v_only_packed(
     v_params,
     all_moves, V0, hash_vec, V0_hash,
@@ -544,6 +554,7 @@ def _build_step_body_v_only_packed(
     q_mode=False,
     qv_consistency=0.0,
     pre_topk_mult=0,
+    return_rank_parts=False,
 ):
     """Per-shard V-only step body, Phase A+B (+ optional D) variant.
 
@@ -602,7 +613,7 @@ def _build_step_body_v_only_packed(
         n_chunks = n // chunk_size
         chunks = x.reshape(n_chunks, chunk_size, S)
         def _scan_fn(_, chunk):
-            return _, model_apply(params, chunk, dtype=dtype)
+            return _, _rank_forward(model_apply, params, chunk, dtype)
         _, outs = jax.lax.scan(_scan_fn, None, chunks)
         if outs.ndim == 2:
             return outs.reshape(n)
@@ -627,7 +638,7 @@ def _build_step_body_v_only_packed(
         chunks = parents.reshape(n_chunks, internal_bs, S)
 
         def _scan_fn(_, chunk):
-            q, v = model_apply_qv(params, chunk, dtype=dtype)
+            q, v = _rank_forward(model_apply_qv, params, chunk, dtype)
             return _, (q, v)
 
         _, (qs, vs) = jax.lax.scan(_scan_fn, None, chunks)
@@ -645,19 +656,7 @@ def _build_step_body_v_only_packed(
     HIST_SIZE = 1 << HIST_BITS
     HIST_MASK = HIST_SIZE - 1
 
-    def beam_step_local(states, min_v_log, found_step, found_pos_local,
-                        found_pos_rank, verify_state, hist, in_move, j):
-        # Squeeze leading shard axis (shard_map gives each rank shape (1, ...)).
-        states = states[0]
-        min_v_log = min_v_log[0]
-        found_step = found_step[0]
-        found_pos_local = found_pos_local[0]
-        found_pos_rank = found_pos_rank[0]
-        verify_state = verify_state[0]
-        hist = hist[0]
-        in_move = in_move[0]
-        rank_int = jax.lax.axis_index("cores").astype(jnp.int32)
-
+    def send_rank(states, in_move):
         # 1. Generate children of owned states.
         #
         # PROGRESSIVE TOP-K (`pre_topk_mult` > 0, q_mode only): do NOT materialize all
@@ -791,12 +790,10 @@ def _build_step_body_v_only_packed(
                 bucket = bucket.at[:, state_size + 6].set(((top_v_S_u16 >> 8) & 0xFF).astype(jnp.uint8))
             send_buckets = send_buckets.at[S].set(bucket)
 
-        # 5. all_to_all: bucket S from each sender goes to rank S.
-        recv_buckets = jax.lax.all_to_all(
-            send_buckets, axis_name="cores",
-            split_axis=0, concat_axis=0, tiled=True,
-        )
+        return send_buckets
 
+    def receive_rank(recv_buckets, min_v_log, found_step, found_pos_local,
+                     found_pos_rank, verify_state, hist, rank_int, j):
         # 6. Unpack received candidates.
         recv_flat = recv_buckets.reshape(-1, PACK_SIZE)
         recv_states_u8 = recv_flat[:, 0:state_size]
@@ -875,13 +872,15 @@ def _build_step_body_v_only_packed(
 
         top_v_keep, keep_sorted_idx = _topk_smallest(sorted_v_masked, B_local)
 
-        chosen_states = sorted_states[keep_sorted_idx]
-        chosen_parent_local = sorted_parent_local[keep_sorted_idx]
-        chosen_parent_rank = sorted_sender_rank[keep_sorted_idx]
-        chosen_move = sorted_move[keep_sorted_idx]
+        # Fixed-shape top_k returns masked candidates when a rank is underfilled.
+        # Their sticker rows are real permutations, but duplicates/history must stay
+        # inactive in the next expansion, history, parent tree and goal checks.
+        chosen_is_real = ~drop_mask[keep_sorted_idx] & (top_v_keep < BIG_F32 * 0.5)
+        chosen_states = jnp.where(chosen_is_real[:, None], sorted_states[keep_sorted_idx], jnp.uint8(0))
+        chosen_parent_local = jnp.where(chosen_is_real, sorted_parent_local[keep_sorted_idx], 0)
+        chosen_parent_rank = jnp.where(chosen_is_real, sorted_sender_rank[keep_sorted_idx], 0)
+        chosen_move = jnp.where(chosen_is_real, sorted_move[keep_sorted_idx], jnp.int8(-1))
         chosen_h = sorted_h[keep_sorted_idx]
-        chosen_state_sum = jnp.sum(chosen_states.astype(jnp.int32), axis=1)
-        chosen_is_real = (chosen_state_sum != 0)
 
         # Roll this rank's history: drop the oldest row, append this step's
         # selection (sorted, with padding slots stored as the -1 sentinel).
@@ -902,7 +901,7 @@ def _build_step_body_v_only_packed(
         packed_backptr = (
             (chosen_parent_local.astype(jnp.uint32) & jnp.uint32(BPTR_PL_MASK))
             | (chosen_parent_rank.astype(jnp.uint32) << jnp.uint32(BPTR_RANK_SHIFT))
-            | (chosen_move.astype(jnp.uint32) << jnp.uint32(BPTR_MOVE_SHIFT))
+            | (jnp.where(chosen_is_real, chosen_move, 0).astype(jnp.uint32) << jnp.uint32(BPTR_MOVE_SHIFT))
         )
 
         new_min_v_log = min_v_log.at[j].set(top_v_keep[0])
@@ -966,6 +965,17 @@ def _build_step_body_v_only_packed(
                 trace_pos[None],
                 trace_v[None],
                 trace_cutoff[None])
+
+    if return_rank_parts:
+        return send_rank, receive_rank
+
+    def beam_step_local(states, min_v_log, found_step, found_pos_local,
+                        found_pos_rank, verify_state, hist, in_move, j):
+        outgoing = send_rank(states[0], in_move[0])
+        incoming = jax.lax.all_to_all(outgoing, axis_name="cores", split_axis=0, concat_axis=0, tiled=True)
+        rank = jax.lax.axis_index("cores").astype(jnp.int32)
+        return receive_rank(incoming, min_v_log[0], found_step[0], found_pos_local[0],
+                            found_pos_rank[0], verify_state[0], hist[0], rank, j)
 
     return beam_step_local
 
@@ -1040,7 +1050,7 @@ def _build_step_body_v_only_packed_streaming(
         n_chunks_inner = n // chunk_size
         chunks = x.reshape(n_chunks_inner, chunk_size, S)
         def _scan_fn(_, c):
-            return _, model_apply(params, c, dtype=dtype)
+            return _, _rank_forward(model_apply, params, c, dtype)
         _, outs = jax.lax.scan(_scan_fn, None, chunks)
         if outs.ndim == 2:
             return outs.reshape(n)
@@ -1062,7 +1072,7 @@ def _build_step_body_v_only_packed_streaming(
         chunks = parents.reshape(n_chunks, internal_bs, S)
 
         def _scan_fn(_, c):
-            q, v = model_apply_qv(params, c, dtype=dtype)
+            q, v = _rank_forward(model_apply_qv, params, c, dtype)
             return _, (q, v)
 
         _, (qs, vs) = jax.lax.scan(_scan_fn, None, chunks)
@@ -1303,13 +1313,15 @@ def _build_step_body_v_only_packed_streaming(
 
         top_v_keep, keep_sorted_idx = _topk_smallest(sorted_v_masked, B_local)
 
-        chosen_states = sorted_states[keep_sorted_idx]
-        chosen_parent_local = sorted_parent_local[keep_sorted_idx]
-        chosen_parent_rank = sorted_sender_rank[keep_sorted_idx]
-        chosen_move = sorted_move[keep_sorted_idx]
+        # Fixed-shape top_k returns masked candidates when a rank is underfilled.
+        # Their sticker rows are real permutations, but duplicates/history must stay
+        # inactive in the next expansion, history, parent tree and goal checks.
+        chosen_is_real = ~drop_mask[keep_sorted_idx] & (top_v_keep < BIG_F32 * 0.5)
+        chosen_states = jnp.where(chosen_is_real[:, None], sorted_states[keep_sorted_idx], jnp.uint8(0))
+        chosen_parent_local = jnp.where(chosen_is_real, sorted_parent_local[keep_sorted_idx], 0)
+        chosen_parent_rank = jnp.where(chosen_is_real, sorted_sender_rank[keep_sorted_idx], 0)
+        chosen_move = jnp.where(chosen_is_real, sorted_move[keep_sorted_idx], jnp.int8(-1))
         chosen_h = sorted_h[keep_sorted_idx]
-        chosen_state_sum = jnp.sum(chosen_states.astype(jnp.int32), axis=1)
-        chosen_is_real = (chosen_state_sum != 0)
 
         # Roll this rank's history: drop the oldest row, append this step's
         # selection (padding slots stored as the -1 sentinel).
@@ -1326,7 +1338,7 @@ def _build_step_body_v_only_packed_streaming(
         packed_backptr = (
             (chosen_parent_local.astype(jnp.uint32) & jnp.uint32(BPTR_PL_MASK))
             | (chosen_parent_rank.astype(jnp.uint32) << jnp.uint32(BPTR_RANK_SHIFT))
-            | (chosen_move.astype(jnp.uint32) << jnp.uint32(BPTR_MOVE_SHIFT))
+            | (jnp.where(chosen_is_real, chosen_move, 0).astype(jnp.uint32) << jnp.uint32(BPTR_MOVE_SHIFT))
         )
 
         new_min_v_log = min_v_log.at[j].set(top_v_keep[0])
@@ -1646,6 +1658,7 @@ def _compile_packed_step(
             inv_move_tbl=inv_move_tbl,
             qv_consistency=qv_consistency,
             pre_topk_mult=pre_topk_mult,
+            return_rank_parts=virtual_ranks,
         )
     else:
         step_body = _build_step_body_v_only_packed_streaming(
@@ -1669,6 +1682,19 @@ def _compile_packed_step(
 
     @partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4, 5, 6, 7))  # NOT j_arr
     def step_fn(states, mv_log, fs, fpl, fpr, vstate, hist_in, inmv_in, j_arr):
+        if virtual_ranks and parent_chunk is None:
+            # Execute the TPU rank-local kernels at their original shapes. Only
+            # the [sender, receiver] axis swap replaces the hardware collective.
+            send_rank, receive_rank = step_body
+            outgoing = jax.lax.map(lambda item: send_rank(*item), (states, inmv_in))
+            incoming = jnp.swapaxes(outgoing, 0, 1)
+            ranks = jnp.arange(world_size, dtype=jnp.int32)
+            def receive(item):
+                out = receive_rank(*item, j_arr)
+                values = tuple(x[0] for x in out)
+                return (*values, jnp.count_nonzero(jnp.any(values[0] != 0, axis=-1)))
+            return jax.lax.map(receive, (incoming, mv_log, fs, fpl, fpr, vstate, hist_in, ranks))
+
         def measured_step(*args):
             out = step_body(*args)
             real_count = jnp.count_nonzero(jnp.any(out[0] != 0, axis=-1), axis=1)

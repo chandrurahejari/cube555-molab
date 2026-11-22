@@ -76,6 +76,10 @@ def tpu_case(kind, pid, beam, depth):
                 if event["event"] == "probe":
                     current["phase"] = event["stage"]
                     report.setdefault("jax_probes", {})[event["stage"]] = event
+                    if event["stage"] == "model_ready":
+                        current.update(model_micro=event["model_micro"], parent_chunk=event["parent_chunk"],
+                                       local_beam=event["local_beam"], k_per_peer=event["k_per_peer"])
+                        report["configuration"]["model_micro"] = current["model_micro"]
                 if event["event"] == "layer_audit":
                     report.setdefault("layer_audit", []).append(event)
                 if event["event"] == "snapshot":
@@ -105,7 +109,7 @@ def tpu_case(kind, pid, beam, depth):
     args = [python, repo / "tools/tpu_solve.py", "--competition", search_competition, "--assets", inputs / "model",
             "--output", folder, "--pid", pid, "--beam", beam, "--depth", depth, "--device", "gpu"]
     if (pid, symmetry, inverse, beam, depth) == (46, 0, False, 8192, 32):
-        args.append("--layer-audit")
+        args.extend(["--layer-audit", "--model-micro", "128"])
     save(f"{kind} PID {pid} / beam {beam}")
     with log.open("wb") as stdout:
         child = subprocess.Popen(list(map(str, args)), env=env, stdout=stdout, stderr=subprocess.STDOUT, start_new_session=True)

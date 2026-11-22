@@ -188,6 +188,23 @@ def _multiset(states):
     return Counter(row.tobytes() for row in states.ravel())
 
 
+def _candidate_scores(layer, parent_layer):
+    """Identify the scored (parent permutation, move) independent of rank and slot."""
+    result = {}
+    states, packed, scores = layer["states"], layer["packed"], layer["scores"]
+    active = np.any(states, axis=-1) & (scores < 5e8)
+    for rank, slot in np.argwhere(active):
+        pointer = int(packed[rank, slot])
+        owner, index = (pointer >> 24) & 7, pointer & 0xffffff
+        parents = parent_layer["states"]
+        if owner >= parents.shape[0] or index >= parents.shape[1] or pointer >> 27 >= 30:
+            continue
+        parent = parents[owner, index]
+        key = (parent.tobytes(), pointer >> 27)
+        result[key] = float(scores[rank, slot])
+    return result
+
+
 def _compare_layer(left, right):
     a, b = left["states"], right["states"]
     if a.shape != b.shape:
@@ -238,22 +255,60 @@ def _compare_layer(left, right):
 
 
 def compare_directories(left, right):
-    """Return the first unequal layer. Counts compare full sticker bytes including multiplicity."""
+    """Compare every saved layer and report first differences in scores and frontier separately."""
     def snapshots(path):
         return {int(p.stem.split("-")[-1]): p for p in Path(path).glob("layer-*.npz")}
     left_files, right_files = snapshots(left), snapshots(right)
     if not left_files and not right_files:
         raise ValueError("Both audit directories are missing layer snapshots.")
-    checked = []
+    checked, layers = [], []
+    first = first_frontier = first_scores = None
+    first_detail = {}
+    prev_a = prev_b = None
     for layer in sorted(left_files.keys() | right_files.keys()):
         if layer not in left_files or layer not in right_files:
-            return dict(equal=False, checked=checked, first_unequal=layer,
-                        missing_from="left" if layer not in left_files else "right")
-        difference = _compare_layer(_load_layer(left_files[layer]), _load_layer(right_files[layer]))
-        if difference:
-            return dict(equal=False, checked=checked, first_unequal=layer, difference=difference)
-        checked.append(layer)
-    return dict(equal=True, checked=checked, first_unequal=None)
+            direction = "left" if layer not in left_files else "right"
+            layers.append(dict(layer=layer, missing_from=direction))
+            if first is None:
+                first, first_detail = layer, dict(missing_from=direction)
+            prev_a = prev_b = None
+            continue
+        a, b = _load_layer(left_files[layer]), _load_layer(right_files[layer])
+        difference = _compare_layer(a, b)
+        summary = dict(layer=layer, same_slots=not ("different_slots" in difference or "left_shape" in difference),
+                       active_left=int(np.any(a["states"],axis=-1).sum()), active_right=int(np.any(b["states"],axis=-1).sum()),
+                       left_only=difference.get("left_only_count", 0), right_only=difference.get("right_only_count", 0),
+                       different_pointer_slots=difference.get("packed", {}), different_q_slots=difference.get("scores", {}))
+        if a["states"].shape!=b["states"].shape:
+            left_counts = _multiset(_state_views(a["states"]))
+            right_counts = _multiset(_state_views(b["states"]))
+            summary.update(left_only=sum((left_counts-right_counts).values()), right_only=sum((right_counts-left_counts).values()))
+        # Zero rows are padding. Count only legal sticker rows when comparing frontiers.
+        a_pad = a["states"].shape[0]*a["states"].shape[1]-summary["active_left"]
+        b_pad = b["states"].shape[0]*b["states"].shape[1]-summary["active_right"]
+        summary["left_only"] -= max(0,a_pad-b_pad)
+        summary["right_only"] -= max(0,b_pad-a_pad)
+        if first_frontier is None and (summary["left_only"] or summary["right_only"]):
+            first_frontier = layer
+        if first_scores is None and difference.get("scores"):
+            first_scores = layer
+        if first is None and difference:
+            first, first_detail = layer, dict(difference=difference)
+        if not difference:
+            checked.append(layer)
+        if prev_a is not None and all("packed" in view and "scores" in view for view in (a, b)):
+            scores_a, scores_b = _candidate_scores(a, prev_a), _candidate_scores(b, prev_b)
+            shared = scores_a.keys() & scores_b.keys()
+            unequal = sorted(k for k in shared if scores_a[k] != scores_b[k])
+            summary.update(shared_parent_moves=len(shared), same_parent_move_q_differences=len(unequal))
+            if unequal:
+                key = unequal[0]
+                summary["q_example"] = dict(parent_stickers=list(key[0]), move_index=key[1],
+                                            left=scores_a[key], right=scores_b[key])
+        layers.append(summary)
+        prev_a, prev_b = a, b
+    return dict(equal=first is None, checked=checked, first_unequal=first, first_frontier_difference=first_frontier,
+                first_score_slot_difference=first_scores, layers=layers, **first_detail)
 
 
 if __name__ == "__main__":

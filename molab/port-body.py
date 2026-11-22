@@ -832,6 +832,7 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         return row
 
     __TPU_RUNNER__
+    __PATH_SELECTION__
 
     try:
         if type(symmetry) is not int or not 0 <= symmetry < 48 or type(inverse) is not bool:
@@ -943,7 +944,7 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
                        CAYLEYPY_BUILD_DIR=str(output / "build"))
         else:
             report["backend"] = "kaggle_jax_logical_ranks_cuda"
-            report["configuration"].update(logical_ranks=8, score_precision="bfloat16", solution_mode="first_endgame_hit")
+            report["configuration"].update(logical_ranks=8, model_micro=4096, score_precision="bfloat16", solution_mode="first_endgame_hit")
             for obsolete in ("b_micro", "lanes", "collect_extra_depths", "max_collected_solutions"):
                 report["configuration"].pop(obsolete, None)
             save("preparing_jax_gpu")
@@ -959,7 +960,14 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         search_competition = prepare_frame_competition(search_competition, output / "frame-competition",
                                                       symmetry, inverse, frame_tables)
         # Solve the requested cube at the exact width selected in the form.
-        solve_case = case if use_native else tpu_case
+        search_case = case if use_native else tpu_case
+        def solve_case(kind, pid, beam, depth):
+            row = search_case(kind, pid, beam, depth)
+            if kind != "capacity" and row["status"] == "complete":
+                selected = best_verified_path(pid, inputs / "competition", read_json(inputs / "model/puzzle_info.json"), row.get("solution"))
+                row["best_verified_path"] = selected
+                report.setdefault("best_verified_paths", {})[str(pid)] = selected
+            return row
         solved = solve_case("solve", puzzle_id, requested_beam, requested_depth)
         if solved.get("solution"):
             report["solution"] = solved["solution"]

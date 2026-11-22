@@ -65,7 +65,9 @@ def _(BASELINE, BEAM_WIDTH, CAPACITY_BEAMS, DRIVE_CONFIG, INVERSE, LONGEST_CUBES
                   "Прошло: " + str(report.get("elapsed_seconds", 0)) + " с."),
             mo.ui.table([dict(id=a["puzzle_id"], beam=a["effective_beam"],
                              symmetry=a["symmetry"], baseline=a["baseline_length"],
-                             length=a.get("solution", {}).get("length"),
+                             beam_length=a.get("solution", {}).get("length"),
+                             best_verified=a.get("best_verified_path", {}).get("length"),
+                             best_source=a.get("best_verified_path", {}).get("source"),
                              seconds=a["wall_seconds"], status=a["status"])
                          for a in report["attempts"]], selection=None),
             mo.plain_text("MOLAB_RESULT " + _json),
@@ -108,6 +110,7 @@ def embedded_body():
     body = body.replace("    __SYMMETRY_HELPERS__", textwrap.indent(helpers, "    "))
     body = body.replace("    __DRIVE_HELPERS__", textwrap.indent((root / 'drive_sink.py').read_text(encoding='utf-8'), '    '))
     body = body.replace("    __TPU_RUNNER__", textwrap.indent((root / 'tpu_case.py').read_text(encoding='utf-8'), '    '))
+    body = body.replace("    __PATH_SELECTION__", textwrap.indent((root / 'path_selection.py').read_text(encoding='utf-8'), '    '))
     checkpoint = (root / 'checkpoint_publisher.py').read_text(encoding='utf-8')
     drive_transport = root / 'drive_checkpoint.py'
     if drive_transport.is_file():
