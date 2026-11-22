@@ -264,6 +264,26 @@ class BenchmarkTests(unittest.TestCase):
         self.controller.state['prior_attempts'] = list(range(1,17))
         self.assertIsNone(self.controller.plan_next())
 
+    def test_empty_inventory_cannot_override_live_external_drive(self):
+        c = self.controller
+        c.state.update(mode='tpu_parity_four', listing={'running':[]}, listed_at=self.now)
+        job = dict(cube=404, id='external', key='external_job', drive_key='write-id', status='solve',
+                   drive_received_utc=module.datetime.fromtimestamp(self.now,module.timezone.utc).isoformat())
+        module.atomic_json(self.exe.parent/'runs/external_job/job.json', job)
+        self.assertTrue(c.wait_for_external_drive(self.now))
+        self.assertEqual(self.invocations[-1][0], '--result')
+        self.assertIn('external_job', self.invocations[-1])
+        self.receipt({'job':job})
+        self.assertIsNone(c.state['pending'])
+        self.now += 1201
+        self.assertTrue(c.wait_for_external_drive(self.now))
+        self.receipt({'job':dict(job,communication_error=True)})
+        self.now += 301
+        self.assertTrue(c.wait_for_external_drive(self.now))
+        self.receipt({'job':job})
+        self.now += 11
+        self.assertFalse(c.wait_for_external_drive(self.now))
+
     def test_diagnostic_design_is_paired_repeatable_and_covers_48_frames(self):
         lengths = {45:11, 68:32, 71:36, 80:36}
         plan = module.diagnostic_plan(lengths, 1983)

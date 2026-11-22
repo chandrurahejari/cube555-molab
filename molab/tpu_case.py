@@ -1,35 +1,46 @@
 def prepare_jax_gpu():
-    """Test the actual XLA CUDA device in a child before starting the search."""
-    python = Path(sys.executable)
-    packages = cache / ("jax-0.7.2-py" + str(sys.version_info.major) + str(sys.version_info.minor))
+    """Keep PJRT entry-point discovery inside one version-pinned worker environment."""
+    version = "0.7.2"
+    venv = cache / f"jax-cuda13-{version}-venv-py{sys.version_info.major}{sys.version_info.minor}"
+    python = venv / "bin/python"
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
     env.update(JAX_ENABLE_X64="True", JAX_PLATFORMS="cuda", XLA_PYTHON_CLIENT_PREALLOCATE="false",
-               PYTHONPATH=os.pathsep.join(filter(None, (str(packages), env.get("PYTHONPATH")))))
+               PYTHONNOUSERSITE="1", VIRTUAL_ENV=str(venv))
     uv = shutil.which("uv")
-    def install(requirement, directory, *extra):
-        installer = [uv, "pip", "install", "--python", python] if uv else [python, "-m", "pip", "install"]
-        command([*installer, "--target", directory, *extra, requirement])
-    check = ("import jax; assert jax.__version__ == '0.7.2', jax.__version__; "
-             "import jax.numpy as j; d=jax.devices('gpu')[0]; "
-             "x=j.ones((16,16),dtype=j.bfloat16); assert float((x@x).block_until_ready()[0,0])==16; "
-             "print(d.device_kind)")
+    if not python.exists():
+        create = [uv, "venv", "--python", sys.executable, venv] if uv else [sys.executable, "-m", "venv", venv]
+        command(create)
+    installer = [uv, "pip", "install", "--python", python] if uv else [python, "-m", "pip", "install"]
+    check = (
+        "import json, sys, importlib.metadata as m; from pathlib import Path; "
+        "names=('jax','jaxlib','jax-cuda13-plugin','jax-cuda13-pjrt'); "
+        "versions={n:m.version(n) for n in names}; "
+        f"assert set(versions.values())=={{'{version}'}}, versions; "
+        "assert all(Path(m.distribution(n).locate_file('')).resolve().is_relative_to(Path(sys.prefix).resolve()) "
+        "for n in names), 'JAX package outside the worker environment'; "
+        "import jax, jax.numpy as j; d=jax.devices('gpu')[0]; "
+        "x=j.ones((16,16),dtype=j.bfloat16); assert float((x@x).block_until_ready()[0,0])==16; "
+        "print(json.dumps(dict(jax=jax.__version__, device=d.device_kind, versions=versions,"
+        " platform_version=d.client.platform_version, memory_limit_bytes=(d.memory_stats() or {}).get('bytes_limit'))))")
     def probe():
         return command([python, "-c", check], capture=True, check=False)
     result = probe()
     if result.returncode:
-        # Prefer the CUDA libraries already present in the Molab image.
-        install("jax[cuda13-local]==0.7.2", packages)
+        save("installing_jax_cuda_plugin")
+        command([*installer, f"jax[cuda13-local]=={version}"])
         result = probe()
     if result.returncode:
         save("installing_jax_cuda_libraries")
-        install("jax[cuda13]==0.7.2", packages, "--upgrade")
+        command([*installer, f"jax[cuda13]=={version}"])
         result = probe()
     if result.returncode:
         raise RuntimeError("JAX CUDA initialization failed: " + result.stdout[-3500:])
-    if command([python, "-c", "import torch"], capture=True, check=False).returncode:
-        weights_loader = cache / "torch-cpu-loader"
-        install("torch==2.8.0", weights_loader, "--index-url", "https://download.pytorch.org/whl/cpu")
-        env["PYTHONPATH"] += os.pathsep + str(weights_loader)
-    report["jax_hardware"] = dict(jax="0.7.2", device=result.stdout.strip().splitlines()[-1])
+    report["jax_hardware"] = json.loads(result.stdout.strip().splitlines()[-1])
+    if command([python, "-c", "import torch; assert torch.__version__.split('+')[0] == '2.8.0'"],
+               capture=True, check=False).returncode:
+        save("installing_checkpoint_loader")
+        command([*installer, "--index-url", "https://download.pytorch.org/whl/cpu", "torch==2.8.0+cpu"])
     return python
 
 
@@ -65,6 +76,10 @@ def tpu_case(kind, pid, beam, depth):
                 if event["event"] == "probe":
                     current["phase"] = event["stage"]
                     report.setdefault("jax_probes", {})[event["stage"]] = event
+                if event["event"] == "layer_audit":
+                    report.setdefault("layer_audit", []).append(event)
+                if event["event"] == "snapshot":
+                    report.setdefault("audit_snapshots", []).append({k:event[k] for k in ("layer","data","states_sha256")})
                 if event["event"] not in ("layer_start", "layer_end"):
                     continue
                 index = int(event["layer"]) - 1
@@ -89,6 +104,8 @@ def tpu_case(kind, pid, beam, depth):
 
     args = [python, repo / "tools/tpu_solve.py", "--competition", search_competition, "--assets", inputs / "model",
             "--output", folder, "--pid", pid, "--beam", beam, "--depth", depth, "--device", "gpu"]
+    if (pid, symmetry, inverse, beam, depth) == (46, 0, False, 8192, 32):
+        args.append("--layer-audit")
     save(f"{kind} PID {pid} / beam {beam}")
     with log.open("wb") as stdout:
         child = subprocess.Popen(list(map(str, args)), env=env, stdout=stdout, stderr=subprocess.STDOUT, start_new_session=True)

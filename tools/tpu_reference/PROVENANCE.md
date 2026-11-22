@@ -14,3 +14,16 @@ Kaggle identifies the dataset as version 3, updated 11 November 2026, and lists 
 The optional `on_layer` callback receives start and end times in Unix seconds, plus the occupied frontier count at each completed layer. The seed uses up to 30 distinct choices replicated across eight ranks. Its event reports distinct choices in `active_count` and replicated occupancy in `active_slots`. Subsequent events also contain occupancy by receiver rank, plus measured device, host-transfer and backpointer-write times. A reported `path_idx` ends at the selected goal or endgame state. The calling notebook reconstructs the suffix from the endgame table and verifies the complete path on the original scramble.
 
 Run `python -m tools.tpu_reference.parity_test` in a fresh process to compare physical and virtual rank placement on CPU.
+
+### Comparison with chunked scoring
+
+`python -m tools.tpu_reference.compare_chunks --competition PATH --assets PATH` runs the two original step implementations with the same Kaggle weights and root. The CPU check on cube 76 used frame 0 forward, a global beam of 256, model microbatch 4, and compared the ordinary step to parent chunks of 8. All 14 output arrays matched at each of depths 2 through 5, including every selected permutation, slot, backpointer, and history row. The root had 15 repeated values among its 30 BF16 action scores.
+
+| Depth | Occupied slots | Distinct states | Repeated Q values among 960 next actions on rank 0 | Repeated child states before selection across ranks |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 256 | 58 | 932 | 6,157 |
+| 3 | 256 | 239 | 919 | 1,312 |
+| 4 | 256 | 256 | 920 | 486 |
+| 5 | 256 | 256 | 923 | 426 |
+
+Both Kaggle implementations mask discarded scores with a large sentinel and take a fixed number of slots. When a rank has too few eligible states, a masked slot can still hold a nonzero permutation. Occupancy counts such slots. Distinct states in this table were counted by comparing the complete permutations. Their child hashes showed no collisions on these four layers. For any permutation of the 150 stickers, the pinned receiver hash lies between 4,067,547,408,555,030,138 and 7,949,742,120,286,934,549, as obtained by pairing the sorted weights with descending and ascending sticker values. This bound excludes signed 64-bit overflow.

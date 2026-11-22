@@ -719,7 +719,14 @@ class Controller:
                                 entry.update(state='finished', outcome='cloud_absent_without_terminal_report',
                                              finished=self.clock(), released=True)
         elif pending.get('target_id'):
-            if cleanup:
+            if action == 'result':
+                # Read-only refresh of a different Form 1 notebook whose Drive
+                # heartbeat can be newer than the visible browser inventory.
+                key = pending['target_id']
+                result = receipt.get('job') or {}
+                good = result.get('key') == key and not result.get('communication_error') and not receipt.get('error')
+                self.state.setdefault('external_reads', {})[key] = {'time':now,'ok':good}
+            elif cleanup:
                 target = pending['target_id']
                 result = receipt.get('job') or {}
                 stopped = (result.get('id') == target and result.get('session_released') and not receipt.get('error'))
@@ -818,6 +825,43 @@ class Controller:
     def parity_successes(self):
         return set(self.state.get('prior_successes', [])) | {
             t['cube'] for t in self.state['jobs'] if t.get('quality_passed') is True}
+
+    def wait_for_external_drive(self, now):
+        # Molab's visible list can omit another browser profile's running notebook.
+        # Cross-check independently launched Form 1 notebooks before allocating a GPU.
+        if self.state.get('mode') != 'tpu_parity_four':
+            return False
+        if now < self.state.get('external_scan_at', 0):
+            return bool(self.state.get('external_blocker'))
+        self.state['external_scan_at'] = now + 10
+        self.state.pop('external_blocker', None)
+        own = {(t.get('job') or {}).get('id') for t in self.state['jobs']}
+        for path in sorted((self.first.parent/'runs').glob('*/job.json'), reverse=True):
+            job = read_json(path, {})
+            if (not job.get('id') or job['id'] in own or job.get('session_released')
+                or job.get('status') in END_STATUSES or not job.get('drive_key')):
+                continue
+            try:
+                received = datetime.fromisoformat(job['drive_received_utc'].replace('Z','+00:00')).timestamp()
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            key = job['key']
+            reads = self.state.get('external_reads', {}).get(key, {})
+            # Consider recent active notebooks and previously observed leases.
+            if now - received > SESSION_LIMIT and not reads:
+                continue
+            fresh = now - received <= FIRST_WRITE_TIMEOUT
+            stale_confirmed = (not fresh and reads.get('ok') and reads['time'] >= received + FIRST_WRITE_TIMEOUT)
+            if stale_confirmed:
+                continue
+            self.state['external_blocker'] = key
+            self.state['message'] = f"Ожидаем внешний кубик {job.get('cube')} · последнее сообщение Drive {job.get('drive_received_utc')}."
+            if now - reads.get('time',0) >= POLL_SECONDS:
+                self.request('result',target_id=key)
+            else:
+                self.refresh_snapshot()
+            return True
+        return False
 
     def plan_next(self):
         tests = self.state['jobs']
@@ -940,6 +984,20 @@ class Controller:
         return None
 
     def begin_resume(self):
+        if self.state.get('mode') == 'tpu_parity_four':
+            # A stop acknowledgement can precede the notebook's final Drive report.
+            for test in self.state['jobs']:
+                old = test.get('job') or {}
+                if not old.get('key'):
+                    continue
+                latest = read_json(self.first.parent/'runs'/old['key']/'job.json', {})
+                report = self.report_for(latest)
+                if latest.get('id') == old.get('id') and report.get('status') in END_STATUSES:
+                    test.update(job=latest, outcome=classify(latest,report), completed_layers=completed_layers(latest,report))
+                    measured = {}
+                    if self.competition and update_best_path(measured, latest, self.competition):
+                        length = measured[str(test['cube'])]['length']
+                        test.update(measured_length=length, quality_passed=length <= test['baseline_length'] + 4)
         self.state.update(status='resuming',user_stopped=False,listing=None,listed_at=0,next_list=0,
                           resume_cleanup=dict(started=self.clock(),next_check=self.clock(),
                                               inventory_valid=False,closed_ids=[],running_ids=[],read_jobs=[]),
@@ -1091,6 +1149,8 @@ class Controller:
                 self.request('list')
                 return
         if len(active) >= MAX_RUNNING:
+            return
+        if self.wait_for_external_drive(now):
             return
         candidate = self.plan_next()
         if not candidate:

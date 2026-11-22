@@ -116,6 +116,21 @@ def solve(args, emit):
     from tools.tpu_reference.jax_model import apply, load_params_from_pt, make_blend
     from tools.tpu_reference.jax_beam_spmd_v_only import beam_solve_v_only_spmd_packed, make_mesh
 
+    if args.layer_audit:
+        from tools.tpu_reference.layer_audit import record_layer
+        from tools.tpu_reference.observed_engine import load_observed_engine
+        from tools.tpu_reference.audit_transport import pack_layer
+        previous = None
+        def observe(layer, states, packed, scores):
+            nonlocal previous
+            receipt = record_layer(args.output, layer, states, packed, scores, save_arrays=True)
+            emit(dict(event="layer_audit", **receipt))
+            previous, packet = pack_layer(args.output / f"layer-{layer:04}.npz", previous, moves)
+            emit(dict(event="snapshot", layer=layer, **packet))
+        engine = load_observed_engine(ROOT / "tools/tpu_reference/jax_beam_spmd_v_only.py",
+                                      "tools.tpu_reference.observed_beam", observe)
+        beam_solve_v_only_spmd_packed = engine.beam_solve_v_only_spmd_packed
+
     device = jax.devices(args.device)[0]
     mesh = make_mesh([device])
     emit(dict(event="probe", stage="device_ready", platform=device.platform, device_kind=device.device_kind))
@@ -180,6 +195,7 @@ def main():
     parser.add_argument("--device", choices=("cpu", "gpu"), required=True)
     parser.add_argument("--model-micro", type=int, default=128)
     parser.add_argument("--parent-chunk", type=int, default=16384)
+    parser.add_argument("--layer-audit", action="store_true", help="Record selected states, scores and parents for paired TPU/GPU comparisons.")
     args = parser.parse_args()
     if args.beam < 32 or args.beam % 8 or min(args.depth, args.model_micro, args.parent_chunk) <= 0:
         parser.error("Use a beam divisible by eight (at least 32), and positive depth and batch sizes.")
