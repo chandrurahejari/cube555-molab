@@ -107,6 +107,7 @@ def embedded_body():
     helpers = helpers.replace("__SYM_BLOB__", repr(blob))
     body = body.replace("    __SYMMETRY_HELPERS__", textwrap.indent(helpers, "    "))
     body = body.replace("    __DRIVE_HELPERS__", textwrap.indent((root / 'drive_sink.py').read_text(encoding='utf-8'), '    '))
+    body = body.replace("    __TPU_RUNNER__", textwrap.indent((root / 'tpu_case.py').read_text(encoding='utf-8'), '    '))
     checkpoint = (root / 'checkpoint_publisher.py').read_text(encoding='utf-8')
     drive_transport = root / 'drive_checkpoint.py'
     if drive_transport.is_file():

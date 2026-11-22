@@ -36,3 +36,27 @@ Before the first layer, the native runner compares its loaded GPU TorchScript mo
 ```sh
 python tools/audit_score_parity.py --artifacts ./artifacts --competition ./competition.zip --write-runtime-fixture tools/cube555_score_fixture.hpp
 ```
+
+## Comparing a completed opening with Google Drive telemetry
+
+```sh
+python tools/check_opening_layers.py --artifacts ./artifacts --competition ./competition.zip --drive-report ./drive-report.json
+```
+
+For cube 76 in frame 0, forward direction, at width 4,194,304, an independent CPU JAX replay agreed with the Molab GPU notebook on all counts and score statistics below. The comparison verified checkpoint hashes and reconstructed frontier states from the official cube input. Keys are the logged Q scores in units of 1/1024, after deduplication.
+
+| Native depth | Parents | Generated | Sent | Kept | Minimum key | Median key | Maximum key |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1 | 30 | 30 | 30 | 34,048 | 36,608 | 38,400 |
+| 1 | 30 | 900 | 900 | 736 | 31,488 | 37,376 | 44,288 |
+| 2 | 736 | 22,080 | 21,344 | 17,789 | 29,824 | 38,144 | 49,408 |
+
+The replay covers the unsaturated opening. Once either routing quota binds, candidate-level comparisons require the saturated selector.
+
+## Running the reference JAX search
+
+```sh
+python tools/tpu_solve.py --competition competition --assets artifacts --output run-76 --pid 76 --beam 4194304 --depth 120 --device gpu
+```
+
+The worker reads the specified row of `competition/test.csv` in its supplied frame. It loads both pinned model checkpoints and the exact radius-five table from version 3 of the publisher’s dataset. If the table is missing, it downloads `bfs_endgame.npz` and checks its SHA256. Its table contains 10,739,017 states. The worker records per-layer UTC Unix timestamps and active counts in `events.jsonl` and saves a verified move string, beam prefix and exact suffix in `result.json`. A CPU smoke run on cube 39 at width 64 returned the replay-verified three-move path `-d2.-f3.-f3`, consisting of two beam moves and one table move.

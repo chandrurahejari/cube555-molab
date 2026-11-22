@@ -831,6 +831,8 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         save()
         return row
 
+    __TPU_RUNNER__
+
     try:
         if type(symmetry) is not int or not 0 <= symmetry < 48 or type(inverse) is not bool:
             raise ValueError("TPU symmetry index must be 0..47 and inverse must be boolean")
@@ -915,24 +917,37 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
             raise ValueError("Requested beam must be a positive uint64")
         if any(type(b) is not int or not 1 <= b < 2**64 for b in capacity_beams):
             raise ValueError("Invalid capacity beam")
-        save("preparing_cuda_toolchain")
-        python = prepare_env()
-        probe = command([python, "-c", "import torch,json;print(json.dumps(dict(torch=torch.__version__,cuda=torch.version.cuda,devices=[dict(name=torch.cuda.get_device_name(i),cc=list(torch.cuda.get_device_capability(i)),bytes=torch.cuda.get_device_properties(i).total_memory) for i in range(torch.cuda.device_count())])))"], capture=True)
-        hardware = json.loads(probe.stdout.splitlines()[-1])
-        report["torch_hardware"] = hardware
-        devices = hardware["devices"][:2]
-        ranks = len(devices)
-        if not ranks:
-            raise RuntimeError("NVIDIA driver visible but PyTorch CUDA initialization found no devices")
-        architectures = sorted({tuple(dev["cc"]) for dev in devices})
-        arch = ";".join(f"{major}{minor}" for major, minor in architectures)
         queue_depths = (baseline or {}).get("queue_depths", {})
-        env.update(CUBE555_WORLD_SIZE=str(ranks), CUBE555_CUDA_ARCH=arch,
-                   CUBE555_MAX_DEPTH=str(max([requested_depth, *queue_depths.values()])),
-                   CUBE555_DEVICE_BYTES=str(min(dev["bytes"] for dev in devices)),
-                   TORCH_CUDA_ARCH_LIST=";".join(f"{a}.{b}" for a, b in architectures),
-                   CMAKE_CUDA_ARCHITECTURES=arch,
-                   CAYLEYPY_BUILD_DIR=str(output / "build"))
+        options = drive_config or {}
+        widths = (requested_beam, *capacity_beams)
+        use_native = (bool((options.get("checkpoint") or {}).get("enabled"))
+                      or options.get("cuda_diagnostics", env.get("CUBE555_CUDA_DIAGNOSTICS", "off")) not in (None, False, "off")
+                      or any(width < 32 or width % 8 for width in widths))
+        if use_native:
+            save("preparing_cuda_toolchain")
+            python = prepare_env()
+            probe = command([python, "-c", "import torch,json;print(json.dumps(dict(torch=torch.__version__,cuda=torch.version.cuda,devices=[dict(name=torch.cuda.get_device_name(i),cc=list(torch.cuda.get_device_capability(i)),bytes=torch.cuda.get_device_properties(i).total_memory) for i in range(torch.cuda.device_count())])))"], capture=True)
+            hardware = json.loads(probe.stdout.splitlines()[-1])
+            report["torch_hardware"] = hardware
+            devices = hardware["devices"][:2]
+            ranks = len(devices)
+            if not ranks:
+                raise RuntimeError("NVIDIA driver visible but PyTorch CUDA initialization found no devices")
+            architectures = sorted({tuple(dev["cc"]) for dev in devices})
+            arch = ";".join(f"{major}{minor}" for major, minor in architectures)
+            env.update(CUBE555_WORLD_SIZE=str(ranks), CUBE555_CUDA_ARCH=arch,
+                       CUBE555_MAX_DEPTH=str(max([requested_depth, *queue_depths.values()])),
+                       CUBE555_DEVICE_BYTES=str(min(dev["bytes"] for dev in devices)),
+                       TORCH_CUDA_ARCH_LIST=";".join(f"{a}.{b}" for a, b in architectures),
+                       CMAKE_CUDA_ARCHITECTURES=arch,
+                       CAYLEYPY_BUILD_DIR=str(output / "build"))
+        else:
+            report["backend"] = "kaggle_jax_logical_ranks_cuda"
+            report["configuration"].update(logical_ranks=8, score_precision="bfloat16", solution_mode="first_endgame_hit")
+            for obsolete in ("b_micro", "lanes", "collect_extra_depths", "max_collected_solutions"):
+                report["configuration"].pop(obsolete, None)
+            save("preparing_jax_gpu")
+            python = prepare_jax_gpu()
         save("verifying_source_and_inputs")
         repo = prepare_repo()
         inputs = prepare_inputs()
@@ -944,14 +959,15 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
         search_competition = prepare_frame_competition(search_competition, output / "frame-competition",
                                                       symmetry, inverse, frame_tables)
         # Solve the requested cube at the exact width selected in the form.
-        solved = case("solve", puzzle_id, requested_beam, requested_depth)
+        solve_case = case if use_native else tpu_case
+        solved = solve_case("solve", puzzle_id, requested_beam, requested_depth)
         if solved.get("solution"):
             report["solution"] = solved["solution"]
         if solved["status"] == "failed":
             raise RuntimeError(solved["error"] + " — " + solved.get("diagnostic", ""))
         # Measure the same saturated iteration as the retained original run.
         for beam in sorted(set(capacity_beams)):
-            probe_row = case("capacity", 165, beam, 6)
+            probe_row = solve_case("capacity", 165, beam, 6)
             if probe_row["status"] == "failed":
                 raise RuntimeError(probe_row["error"] + " — " + probe_row.get("diagnostic", ""))
             if probe_row["saturated"]:
@@ -965,12 +981,12 @@ def run_cube555(puzzle_id, requested_beam, requested_depth, capacity_beams, prog
                         ratio_reference_to_observed=374.932 / probe_row["depth5_seconds"],
                         note="Saturated iteration, same commit, model weights and batch sizes. GPU count changes beam alignment and rank distribution.")
                 if not report["solution"] and beam != requested_beam:
-                    retry = case("solve-at-tested-beam", puzzle_id, beam, requested_depth)
+                    retry = solve_case("solve-at-tested-beam", puzzle_id, beam, requested_depth)
                     report["solution"] = retry.get("solution")
         for queued_pid in queue_ids:
             if queued_pid == puzzle_id:
                 continue
-            queued = case("length111", queued_pid, requested_beam, queue_depths.get(queued_pid, requested_depth))
+            queued = solve_case("length111", queued_pid, requested_beam, queue_depths.get(queued_pid, requested_depth))
             if queued["status"] == "failed":
                 raise RuntimeError(queued["error"] + " — " + queued.get("diagnostic", ""))
             save()

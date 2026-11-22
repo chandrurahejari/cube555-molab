@@ -41,7 +41,7 @@ RETRYABLE = {'cloud_unavailable', 'gpu_unavailable', 'not_started', 'import_abse
              'imported_no_session', 'cloud_absent_without_terminal_report', 'no_first_drive_write'}
 MOSCOW = timezone(timedelta(hours=3))
 END_STATUSES = {'complete', 'partial', 'failed', 'gpu_unavailable', 'stopped'}
-PLANNED_MODES = {'diagnostics', 'repair', 'tpu_controls'}
+PLANNED_MODES = {'diagnostics', 'repair', 'tpu_controls', 'tpu_parity_four'}
 
 
 def atomic_json(path, value):
@@ -138,18 +138,22 @@ def diagnostic_plan(lengths, seed):
     return cases
 
 
-def tpu_control_plan(lengths):
+def tpu_control_plan(lengths, parity_four=False):
     # Cube 994 uses the exact frame of artgor TPU v56's verified 110-move solution.
     examples = [(76, 40, 0, False), (142, 100, 0, False), (994, 110, 45, True),
                 (82, 40, 12, True), (166, 100, 23, False), (170, 110, 31, True)]
+    if parity_four:
+        examples = examples[:4]
+    margin = 20 if parity_four else 10
     cases = []
-    for cycle in range(96):
+    for cycle in range(4 if parity_four else 96):
         for cube, length, frame, inverse in examples:
             if lengths.get(cube) != length:
                 raise ValueError(f'Кубик {cube}: ожидалось {length} ходов в исходном CSV.')
-            cases.append(dict(cube=cube, beam=4_194_304, requested_depth=length + 10,
-                              symmetry=(frame+cycle) % 48, inverse=inverse ^ bool((cycle + cycle//48) % 2),
-                              case_number=len(cases)+1, lane='tpu_controls',
+            cases.append(dict(cube=cube, beam=4_194_304, requested_depth=length + margin,
+                              symmetry=(frame+cycle*(13 if parity_four else 1)) % 48,
+                              inverse=inverse ^ bool((cycle + cycle//48) % 2),
+                              case_number=len(cases)+1, lane='tpu_parity_four' if parity_four else 'tpu_controls',
                               purpose=f'Контроль поиска Cube555 для пути длиной {length}'))
     return cases
 
@@ -456,7 +460,7 @@ class Controller:
             self.persist()
 
     def start(self, symmetry=3, hours=24, single=None, diagnostics=False, seed=None,
-              baseline=CURRENT_CSV, repair=None, tpu_controls=False):
+              baseline=CURRENT_CSV, repair=None, tpu_controls=False, tpu_parity_four=False):
         self.reconcile_local_launches()
         if self.state.get('status') in {'running', 'paused', 'stopping','resuming'}:
             raise ValueError('Текущая серия ещё активна.')
@@ -473,7 +477,8 @@ class Controller:
         if not self.first.is_file():
             raise FileNotFoundError(f'Не найдена первая форма: {self.first}')
         plan = None
-        if diagnostics or repair or tpu_controls:
+        is_tpu = tpu_controls or tpu_parity_four
+        if diagnostics or repair or is_tpu:
             if repair:
                 state_file = Path(repair).resolve()
                 if state_file.is_dir():
@@ -491,20 +496,21 @@ class Controller:
             self.lengths = load_lengths(source)
             if repair and hashlib.sha256(baseline_data).hexdigest() != previous['baseline_sha256']:
                 raise ValueError('Контрольная сумма baseline.csv отличается от исходного эксперимента.')
-            if tpu_controls:
-                plan = tpu_control_plan(self.lengths)
+            if is_tpu:
+                plan = tpu_control_plan(self.lengths, parity_four=tpu_parity_four)
             else:
                 plan = repair_plan(previous, self.lengths) if repair else diagnostic_plan(self.lengths, seed)
         now = self.clock()
         deadline = night_deadline(now) if diagnostics else now + hours * 3600
         self.directory = self.data / (time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:6])
         self.directory.mkdir(parents=True)
-        self.state = dict(version=4, layer_count_version=1, mode='tpu_controls' if tpu_controls else 'repair' if repair else 'diagnostics' if diagnostics else 'single' if single else 'benchmark', single=single,
+        mode = 'tpu_parity_four' if tpu_parity_four else 'tpu_controls' if tpu_controls else 'repair' if repair else 'diagnostics' if diagnostics else 'single' if single else 'benchmark'
+        self.state = dict(version=4, layer_count_version=1, mode=mode, single=single,
             status='running', started=now, deadline=deadline,
             symmetry=int(symmetry), poll_seconds=POLL_SECONDS, jobs=[], pending=None,
             listing=None, listed_at=0, next_list=0, message='Проверка работающих ноутбуков через форму 1',
             baseline_lengths={str(k): self.lengths.get(k) for k in (57, 67, 94, 124, 145)})
-        if diagnostics or repair or tpu_controls:
+        if diagnostics or repair or is_tpu:
             rate = historical_layer_rate(self.first.parent / 'runs')
             # Both directions run in the same slot, one after the other.
             budget = deadline - now - CLEANUP_MARGIN
@@ -515,8 +521,26 @@ class Controller:
                     continue
                 planned.extend([dict(a, estimated_seconds=estimated),dict(b, estimated_seconds=estimated)])
                 budget -= 2 * estimated
-            if tpu_controls:
-                self.state['depth_margin'] = 10
+            if is_tpu:
+                self.state['depth_margin'] = 20 if tpu_parity_four else 10
+                if tpu_parity_four:
+                    self.state['quality_tolerance'] = 4
+                    template = self.first.parent / 'cube555_template.py'
+                    release = hashlib.sha256(template.read_bytes()).hexdigest() if template.is_file() else None
+                    self.state['template_sha256'] = release
+                    prior_successes, prior_attempts = set(), set()
+                    if release:
+                        for path in self.data.glob('*/state.json'):
+                            previous_run = read_json(path, {})
+                            if (previous_run.get('mode') != 'tpu_parity_four' or previous_run.get('template_sha256') != release
+                                or previous_run.get('baseline_sha256') != hashlib.sha256(baseline_data).hexdigest()):
+                                continue
+                            for test in previous_run['jobs']:
+                                if test.get('state') == 'finished':
+                                    prior_attempts.add(test['case_number'])
+                                    if test.get('quality_passed') is True:
+                                        prior_successes.add(test['cube'])
+                    self.state.update(prior_attempts=sorted(prior_attempts), prior_successes=sorted(prior_successes))
                 for case in plan:
                     case['estimated_seconds'] = math.ceil(600 + rate * case['beam']/1e6 * (case['requested_depth']-3))
             elif not repair:
@@ -728,6 +752,11 @@ class Controller:
             solution = verified_path(test)
             if self.competition and update_best_path(self.best_paths, job, self.competition):
                 atomic_json(self.best_path_file, self.best_paths)
+            if self.state['mode'] == 'tpu_parity_four' and self.competition and solution:
+                measured = {}
+                if update_best_path(measured, job, self.competition):
+                    test['measured_length'] = measured[str(test['cube'])]['length']
+                    test['quality_passed'] = test['measured_length'] <= test['baseline_length'] + self.state['quality_tolerance']
             if solution and isinstance(test.get('baseline_length'),int):
                 test['verified_solution'] = solution.copy()
                 test['improvement'] = test['baseline_length'] - solution['length']
@@ -786,10 +815,14 @@ class Controller:
         self.persist()
         return True
 
+    def parity_successes(self):
+        return set(self.state.get('prior_successes', [])) | {
+            t['cube'] for t in self.state['jobs'] if t.get('quality_passed') is True}
+
     def plan_next(self):
         tests = self.state['jobs']
         for previous in tests:
-            if previous.get('replay_pending'):
+            if previous.get('replay_pending') and self.state['mode'] != 'tpu_parity_four':
                 fields = ('case_number','cube','beam','symmetry','inverse','requested_depth','lane',
                           'estimated_seconds','cuda_diagnostics','trace_reference','repair_stage','purpose')
                 candidate = {name:previous[name] for name in fields if name in previous}
@@ -844,15 +877,16 @@ class Controller:
                     self.state['plan'].append(extra)
                     return dict(extra,attempt=1)
             return None
-        if self.state.get('mode') in {'diagnostics', 'tpu_controls'}:
-            scheduled = {t['case_number'] for t in tests}
+        if self.state.get('mode') in {'diagnostics', 'tpu_controls', 'tpu_parity_four'}:
+            scheduled = set(self.state.get('prior_attempts', [])) | {t['case_number'] for t in tests}
+            successes = self.parity_successes() if self.state['mode'] == 'tpu_parity_four' else set()
             remaining = self.state['deadline'] - self.clock() - CLEANUP_MARGIN
             cap = min(remaining, SESSION_LIMIT-CLEANUP_MARGIN)
             step_seconds = [r['seconds'] for t in tests for r in t.get('layers', [])
                             if r.get('full_beam') and r.get('depth',0) >= 7 and r.get('seconds',0) > 0]
-            measured = statistics.median(step_seconds) if self.state['mode']=='tpu_controls' and step_seconds else None
+            measured = statistics.median(step_seconds) if self.state['mode']!='diagnostics' and step_seconds else None
             for case in self.state['plan']:
-                if case['case_number'] in scheduled:
+                if case['case_number'] in scheduled or case['cube'] in successes:
                     continue
                 estimate = case.get('estimated_seconds',0)
                 if measured is not None:
@@ -930,8 +964,13 @@ class Controller:
                 self.request('result',test)
                 return
         if cleanup['running_ids']:
-            self.request('shutdown', target_id=cleanup['running_ids'][0])
-            return
+            candidates = cleanup['running_ids']
+            if self.state['mode'] == 'tpu_parity_four':
+                owned = {(t.get('job') or {}).get('id') for t in self.state['jobs']}
+                candidates = [notebook_id for notebook_id in candidates if notebook_id in owned]
+            if candidates:
+                self.request('shutdown', target_id=candidates[0])
+                return
         for test in active:
             job = test.get('job') or {}
             # A complete inventory with zero sessions is the release barrier.
@@ -1060,7 +1099,12 @@ class Controller:
                 self.refresh_snapshot()
                 return
             if diagnostics and not active:
-                if self.state['mode'] == 'repair':
+                if self.state['mode'] == 'tpu_parity_four':
+                    solved = self.parity_successes()
+                    missing = sorted({r['cube'] for r in self.state['plan']} - solved)
+                    message = ('Четыре пути проверены в пределах исходной длины +4.' if not missing else
+                               'Доступные попытки или время исчерпаны. Порог +4 пока не достигнут для: ' + ', '.join(map(str, missing)))
+                elif self.state['mode'] == 'repair':
                     left = len(repair_plan(self.state, {int(k):v for k,v in self.state['baseline_lengths'].items()}))
                     message = f'Повтор завершён. Целевая длина ещё не подтверждена для {left} из {len(self.state["plan"])} случаев.'
                 else:
@@ -1099,7 +1143,7 @@ class Controller:
         if not self.directory:
             return
         columns = ['test_id', 'case_number', 'cube', 'beam', 'effective_beam', 'symmetry', 'inverse', 'requested_depth','improvement','verified_path',
-                   'baseline_length', 'found_length', 'verified', 'outcome', 'status', 'native_search_seconds',
+                   'baseline_length', 'found_length', 'verified', 'quality_passed', 'outcome', 'status', 'native_search_seconds',
                    'notebook_seconds', 'measured_max_frontier_from_depth7', 'full_layers_from_depth7',
                    'mean_full_layer_seconds', 'median_full_layer_seconds', 'completed_layers','last_completed_depth','drive_received_utc','native_reason','url', 'error']
         lines, layers = [], []
@@ -1112,7 +1156,7 @@ class Controller:
             report = self.report_for(job)
             attempts = report.get('attempts') or []
             lines.append(dict(test_id=test['test_id'], case_number=test.get('case_number'),cube=test['cube'], beam=test['beam'],
-                completed_layers=test.get('completed_layers'),
+                completed_layers=test.get('completed_layers'), quality_passed=test.get('quality_passed'),
                 inverse=test.get('inverse', False), last_completed_depth=case.get('last_completed_depth',max((r['depth'] for r in measured), default=None)),
                 drive_received_utc=job.get('drive_received_utc'),native_reason=(attempts[-1].get('stop_reason') or attempts[-1].get('search_outcome') or attempts[-1].get('error')) if attempts else report.get('stop_reason'),
                 effective_beam=job.get('effective_beam') or solution.get('effective_beam'), symmetry=test['symmetry'],
@@ -1247,6 +1291,7 @@ def main():
     action.add_argument('--test', action='store_true', help='Нажать кнопку одиночного теста через форму 1')
     action.add_argument('--diagnostics', action='store_true', help='Ночная проверка на 10 часов, до полудня МСК')
     action.add_argument('--tpu-controls', action='store_true', help='10 часов на кубики с длинами 40, 100 и 110')
+    action.add_argument('--tpu-parity-four', action='store_true', help='Четыре кубика: глубина +20, допустимый путь +4')
     action.add_argument('--repair', type=Path, help='Повторить неудачные тесты из завершённой серии state.json')
     action.add_argument('--resume', action='store_true', help='Продолжить текущую серию после освобождения сессий')
     action.add_argument('--stop', action='store_true', help='Завершить серию и освободить её сессию до нового теста')
@@ -1270,12 +1315,13 @@ def main():
             raise ValueError()
     except ValueError:
         parser.error('--request-id должен быть UUID из 32 шестнадцатеричных символов')
-    requested = args.start or args.test or args.diagnostics or args.tpu_controls or args.repair or args.resume or args.stop
+    requested = args.start or args.test or args.diagnostics or args.tpu_controls or args.tpu_parity_four or args.repair or args.resume or args.stop
     if requested:
         if (requests / (request_id + '.receipt')).exists():
             return
         atomic_json(requests / (request_id + '.json'), dict(start=args.start, test=args.test,
-            diagnostics=args.diagnostics, tpu_controls=args.tpu_controls, seed=args.seed, baseline=str(args.baseline),
+            diagnostics=args.diagnostics, tpu_controls=args.tpu_controls, tpu_parity_four=args.tpu_parity_four,
+            seed=args.seed, baseline=str(args.baseline),
             repair=str(args.repair.resolve()) if args.repair else None, resume=args.resume, stop=args.stop,
             inverse=args.inverse, cuda_diagnostics=args.cuda_diagnostics,
             cube=args.cube, beam=args.beam, depth=args.depth, symmetry=args.symmetry))
@@ -1314,6 +1360,7 @@ def main():
     tpu_button = ttk.Button(controls, text='40 / 100 / 110 · 10 часов',
                             command=lambda: controller.commands.put(('start',dict(tpu_options))))
     tpu_button.pack(side='left', padx=(0,8))
+    parity_options = dict(tpu_parity_four=True, baseline=str(args.baseline))
     ttk.Label(controls, text='Симметрия (0–47)').pack(side='left')
     symmetry = tk.StringVar(value=str(args.symmetry))
     choose = ttk.Combobox(controls, textvariable=symmetry, values=list(range(48)), width=5, state='readonly')
@@ -1357,6 +1404,9 @@ def main():
     repair_source = tk.StringVar()
     repair_button = ttk.Button(single_controls, text='Повторить неудачные', command=repair_run)
     repair_button.pack(side='left', padx=8)
+    parity_button = ttk.Button(single_controls, text='4 кубика · путь до +4',
+                               command=lambda: controller.commands.put(('start',dict(parity_options))))
+    parity_button.pack(side='left', padx=(0, 4))
     status = tk.StringVar(value='Готово. При открытии новые тесты автоматически не создаются.')
     clock_text = tk.StringVar()
     next_action = tk.StringVar()
@@ -1389,6 +1439,7 @@ def main():
         active = snapshot.get('status') in {'running', 'paused', 'resuming', 'stopping'}
         repair_button.state(['disabled'] if active else ['!disabled'])
         tpu_button.state(['disabled'] if active else ['!disabled'])
+        parity_button.state(['disabled'] if active else ['!disabled'])
         start.state(['disabled'] if active else ['!disabled'])
         diagnostic_button.state(['disabled'] if active else ['!disabled'])
         single_start.state(['disabled'] if active else ['!disabled'])
@@ -1404,7 +1455,7 @@ def main():
             status.set(current_wait)
             next_action.set(next_step)
             end = snapshot.get('finished', now)
-            mode = {'single':'Одиночный тест', 'tpu_controls':'40 / 100 / 110 · 10 часов', 'repair':'Повтор неудачных тестов', 'diagnostics':'Ночная проверка до ' + datetime.fromtimestamp(snapshot['deadline'],MOSCOW).strftime('%H:%M МСК')}.get(snapshot.get('mode'),'Испытание на 24 часа')
+            mode = {'single':'Одиночный тест', 'tpu_controls':'40 / 100 / 110 · 10 часов', 'tpu_parity_four':'4 кубика · глубина +20, путь до +4', 'repair':'Повтор неудачных тестов', 'diagnostics':'Ночная проверка до ' + datetime.fromtimestamp(snapshot['deadline'],MOSCOW).strftime('%H:%M МСК')}.get(snapshot.get('mode'),'Испытание на 24 часа')
             clock_text.set(f"{mode} · прошло {duration(end - snapshot['started'])} · осталось {duration(snapshot['deadline'] - now)}")
         jobs = snapshot.get('jobs', [])
         ids = {t['test_id'] for t in jobs}
@@ -1482,6 +1533,12 @@ def main():
                         repair_button.invoke()
                         repair_source.set('')
                         handler = 'repair_button'
+                    elif command.get('tpu_parity_four'):
+                        source = Path(command['baseline'])
+                        tpu_control_plan(load_lengths(source), parity_four=True)
+                        parity_options.update(baseline=str(source))
+                        parity_button.invoke()
+                        handler = 'tpu_parity_four_button'
                     elif command.get('tpu_controls'):
                         source = Path(command['baseline'])
                         tpu_control_plan(load_lengths(source))

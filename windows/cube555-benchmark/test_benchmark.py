@@ -240,6 +240,30 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual((best['76']['path'],best['76']['inverse']),('-r0',False))
         self.assertFalse(module.update_best_path({}, dict(job,result_origin=None), competition))
 
+    def test_parity_four_retries_only_missing_targets_and_resumes_same_build(self):
+        lengths = {76:40,142:100,994:110,82:40}
+        source = self.directory / 'submission.csv'
+        source.write_text('initial_state_id,path\n' + ''.join(
+            f"{cube},{'.'.join(['r0'] * lengths.get(cube, 1))}\n" for cube in range(1035)))
+        (self.exe.parent / 'cube555_template.py').write_text('fixed build')
+        self.controller.state['status'] = 'finished'
+        self.controller.start(tpu_parity_four=True, baseline=source)
+        s = self.controller.state
+        self.assertEqual((len(s['plan']), s['deadline']-s['started'], s['quality_tolerance']), (16,36000,4))
+        self.assertEqual([c['requested_depth'] for c in s['plan'][:4]], [60,120,130,60])
+        self.assertEqual((s['plan'][2]['symmetry'],s['plan'][2]['inverse']), (45,True))
+        s['jobs'] = [dict(c,cube=c['cube'],quality_passed=c['cube']!=142,state='finished')
+                     for c in s['plan'][:4]]
+        next_case = self.controller.plan_next()
+        self.assertEqual((next_case['case_number'],next_case['cube'],next_case['inverse']), (6,142,True))
+        s['status'] = 'finished'
+        self.controller.persist()
+        self.controller.start(tpu_parity_four=True, baseline=source)
+        self.assertEqual(self.controller.parity_successes(), {76,994,82})
+        self.assertEqual(self.controller.plan_next()['case_number'],6)
+        self.controller.state['prior_attempts'] = list(range(1,17))
+        self.assertIsNone(self.controller.plan_next())
+
     def test_diagnostic_design_is_paired_repeatable_and_covers_48_frames(self):
         lengths = {45:11, 68:32, 71:36, 80:36}
         plan = module.diagnostic_plan(lengths, 1983)
